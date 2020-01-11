@@ -48,18 +48,21 @@
 // We set up for three LEDs to be controlled...
 // DEVKIT V1 uses pin 23
 // #define LED1_PIN               23
-#define LED1_PIN                       12
+#define LED1_PIN                       13
 // The PWM channel for the LED 0 to 15
 #define LED1_PWM_CHANNEL               0
 
-#define LED2_PIN                       13
+#define LED2_PIN                       14
 // The PWM channel for the LED 0 to 15
 #define LED2_PWM_CHANNEL               1
 
-#define LED3_PIN                       14
+#define LED3_PIN                       15
 // The PWM channel for the LED 0 to 15
 #define LED3_PWM_CHANNEL               2
 
+#define NUM_LEDS 3
+// prev freq for freq compare, 
+long prevFreqs[NUM_LEDS] = {0, 0, 0};
 
 // Frequency measure
 #define FREQ_MEASURE_PIN              19
@@ -100,14 +103,18 @@ uint64_t myRing[FREQ_MEASURE_SAMPLE_NUM] = {0};
 // average freq intermediate values as globals. Bite me!
 uint64_t sumPeriod;
 float avgPeriod;
-// prev freq for freq compare
-long prevFreq = 0;
 
 hw_timer_t * fTimer = NULL;                       // pointer to a variable of type hw_timer_t 
 portMUX_TYPE fTimerMux = portMUX_INITIALIZER_UNLOCKED;  // synchs between maon cose and interrupt?
 
 // Store the delta changes
 float freqDeltaLut[COOL_PERIOD_SECONDS];
+// Each LED follows the same pattern, but are offset by this number of seconds
+// e.g. LED3 is idx 2, 2 * 90 is 180. LED3 is 180 seconds ahead of LED1.
+#define LED_TIME_OFFSET 90
+// Multiply the timestamp by this number to the power of the LED idx
+// e.g. LED3 is idx 2, 1.1^2 is 1.21
+#define LED_TIME_MULTIPLIER 1.1
 
 // Digital Event Interrupt
 // Enters on falling edge in this example
@@ -144,11 +151,11 @@ String messages;
 // A 'struct' is an object containing other variables
 // This defines the struct data type
 struct ProgramVars {
-  long    pwmFreq;
+  long    pwmFreq[NUM_LEDS];
   long    setFreq;
   bool    useSetFreq;
   long    pwmDutyThou;
-  double  freqDelta;
+  double  freqDelta[NUM_LEDS];
   bool    runVariableDelta;
   double  freqConversionFactor;
   bool    ledEnable;
@@ -158,11 +165,11 @@ struct ProgramVars {
 };
 // This creates a new variable which is of the above struct type
 ProgramVars programVars = {
-  0,      // pwmFreq
+  {0, 0, 0},      // pwmFreq
   0,      // setFreq
   false,  // useSetFreq
   LED_PWM_INITIAL_DUTY,      // pwmDutyThou
-  1.0,    // freqDelta
+  {1.0, 1.0, 1.0},    // freqDelta
   true,    // runVariableDelta
   MOTOR_ZEO_GEARING_FACTOR, // freqConversionFactor
   true,   // ledEnable
@@ -392,7 +399,9 @@ ProgramVars programVars = {
       progVars->stateChange = argDisplayOrSetLong("pwmDuty", comArgState, &progVars->pwmDutyThou, message);
       break;
     case 'm':
-      progVars->stateChange = argDisplayOrSetDoubleFromLong("freqDelta", comArgState, &progVars->freqDelta, 100, message);
+      progVars->stateChange = argDisplayOrSetDoubleFromLong("freqDelta", comArgState, &progVars->freqDelta[0], 100, message);
+      progVars->stateChange = argDisplayOrSetDoubleFromLong("freqDelta", comArgState, &progVars->freqDelta[1], 100, message);
+      progVars->stateChange = argDisplayOrSetDoubleFromLong("freqDelta", comArgState, &progVars->freqDelta[2], 100, message);
       break;
     case 'v':
       progVars->stateChange = argDisplayOrSetBoolean("runVariableDelta", comArgState, &progVars->runVariableDelta, message);
@@ -420,9 +429,13 @@ ProgramVars programVars = {
 String formatProgVars(long time, ProgramVars progVars) {
   return String(time) + " ledEnable: " + String(progVars.ledEnable) +
     " setFreq: " + String(progVars.setFreq) +
-    " pwmFreq: " + String(progVars.pwmFreq) +
+    " pwmFreq: [" + String(progVars.pwmFreq[0]) + ", " +
+    String(progVars.pwmFreq[1]) + ", " +
+    String(progVars.pwmFreq[2]) + "]" +
     " pwmDuty: " + String(progVars.pwmDutyThou) +
-    " freqDelta: " + String(progVars.freqDelta) +
+    " freqDelta: " + String(progVars.freqDelta[0]) + ", " +
+    String(progVars.freqDelta[1]) + ", " +
+    String(progVars.freqDelta[2]) + "]" +
     " pwmDuty: " + String(progVars.pwmDutyThou) +
     " Random string: '" + progVars.randomString +"'";
 }
@@ -465,20 +478,11 @@ void buildLookupTable(KeyPoint *keypoints, uint16_t num_keypoints, float* lookup
       lut_idx++;
     } 
   }
-  while (lut_idx < lookup_table_size) {
+  while (lut_idx < lookup_table_size - 1) {
     lookup_table[lut_idx + 1] = lookup_table[lut_idx];
     lut_idx++;
   }
 }
-
-/** This function modifies the delta/modifier based on the timestamp in seconds
- * on a cycle (hence the modulo)
- **/
-void makeShitCoolAgain(uint32_t timestamp, ProgramVars *programVars) {
-  uint32_t relativeTime = timestamp % COOL_PERIOD_SECONDS;
-  programVars->freqDelta = freqDeltaLut[relativeTime];
-}
-
 
 void setup() {
   // Give a semaphore that we can check in the loop
@@ -566,15 +570,19 @@ void setup() {
   timerStart(fTimer);
 }
 
-inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars) {
+inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars, uint8_t led) {
   if (programVars.runVariableDelta == true) {
-    makeShitCoolAgain(timestamp, &programVars);
+    uint16_t led_time_offset = led * LED_TIME_OFFSET;
+    float time_multiplier = powf(LED_TIME_MULTIPLIER, led);
+    // modifies the delta/modifier based on the timestamp in seconds on a cycle (hence the modulo)
+    uint32_t relativeTime = ((uint32_t)(time_multiplier * timestamp) + led_time_offset) % COOL_PERIOD_SECONDS;
+    programVars.freqDelta[led] = freqDeltaLut[relativeTime];
   }
 
   // Change the PWM freq if it has changed
-  if ( programVars.pwmFreq != prevFreq) {
-    ledcWriteTone(pwm_channel, programVars.pwmFreq);
-    prevFreq = programVars.pwmFreq;
+  if ( programVars.pwmFreq[led] != prevFreqs[led]) {
+    ledcWriteTone(pwm_channel, programVars.pwmFreq[led]);
+    prevFreqs[led] = programVars.pwmFreq[led];
     if (programVars.ledEnable == true) {
       ledcWrite(pwm_channel, programVars.pwmDutyThou);
     } else {
@@ -607,7 +615,9 @@ void loop() {
 
 
       if (programVars.useSetFreq) {
-        programVars.pwmFreq = programVars.setFreq;
+        programVars.pwmFreq[0] = programVars.setFreq;
+        programVars.pwmFreq[1] = programVars.setFreq;
+        programVars.pwmFreq[2] = programVars.setFreq;
       } else {
         // calculate the frequency from the average period
         sumPeriod = 0;
@@ -616,11 +626,16 @@ void loop() {
             sumPeriod += myRing[i];
         }
         avgPeriod = ((float)sumPeriod)/FREQ_MEASURE_SAMPLE_NUM; //or cast sum to double before division
-        programVars.pwmFreq = calculateFinalFrequency(avgPeriod, programVars.freqConversionFactor) * programVars.freqDelta;
+        float final_freq = calculateFinalFrequency(avgPeriod, programVars.freqConversionFactor);
+        programVars.pwmFreq[0] = final_freq * programVars.freqDelta[0];
+        programVars.pwmFreq[1] = final_freq * programVars.freqDelta[1];
+        programVars.pwmFreq[2] = final_freq * programVars.freqDelta[2];
       }
 
       messages = "Setting PWM duty to: " + String(programVars.pwmDutyThou) + \
-        " Frequency to: " + String(programVars.pwmFreq) + \
+        " Frequency to: [" + String(programVars.pwmFreq[0]) + ", " + \
+        String(programVars.pwmFreq[1]) + ", " + \
+        String(programVars.pwmFreq[2]) + "]" + \
         " User set freq to: " + String(programVars.setFreq);
 
       Serial.println(messages);
@@ -644,9 +659,9 @@ void loop() {
       timestamp++;
       timestampQuarter = 0;
 
-      updateLED(LED1_PWM_CHANNEL, programVars);
-      updateLED(LED2_PWM_CHANNEL, programVars);
-      updateLED(LED3_PWM_CHANNEL, programVars);
+      updateLED(LED1_PWM_CHANNEL, programVars, 0);
+      updateLED(LED2_PWM_CHANNEL, programVars, 1);
+      updateLED(LED3_PWM_CHANNEL, programVars, 2);
 
       // print logging info if enabled
       if (programVars.logging == true) {
@@ -656,16 +671,6 @@ void loop() {
       }
     }
   }
-
-  // Do realtime things
-  // Calculate the frequency
-  // programVars.pwmFreq = programVars.useSetFreq;
-  // if (programVars.useSetFreq) {
-  //   programVars.pwmFreq = programVars.useSetFreq;
-  // } else if (fAdded == true) {
-  //   programVars.pwmFreq = calculateFinalFrequency(frequencyRA, programVars.freqConversionFactor) + programVars.freqDelta;
-  // }
-
 
   // While there are characters in the Serial buffer
   // read them in one at a time into sBuffer
