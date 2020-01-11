@@ -163,7 +163,7 @@ ProgramVars programVars = {
  * In C/C++ rather than return the parts, we act on pointers to the variables
  * Pointers to variables (the memory location of a variable) are denoted by a '*'
  * 
- * This function returns EXIT_FAILURE (cuold be 0) if it fails,
+ * This function returns EXIT_FAILURE (could be 0) if it fails,
  * or EXIT_SUCCESS (could be 1) if everything is OK
  **/
  int getCommandAndArgument(String inputString, char *command, String *argument) {
@@ -819,7 +819,7 @@ void setup() {
   // attach the channel to the GPIO to be controlled
   ledcAttachPin(LED_ONBOARD_PIN, LED_PWM_CHANNEL);
   ledcAttachPin(LED_PIN, LED_PWM_CHANNEL);
-
+  ledcWrite(LED_PWM_CHANNEL, programVars.pwmDutyThou);
 
   // Setup frequency measure timer
   // sets pin high
