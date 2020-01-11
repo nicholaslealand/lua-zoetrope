@@ -481,14 +481,6 @@ void makeShitCoolAgain(uint32_t timestamp, ProgramVars *programVars) {
 
 
 void setup() {
-  // Initialise the serial hardware at baude 115200
-  Serial.begin(115200);
- 
-  // Initialise the Bluetooth hardware with a name 'ESP32'
-  if(!SerialBT.begin("ESP32")){
-    Serial.println("An error occurred initializing Bluetooth");
-  }
-
   // Give a semaphore that we can check in the loop
   // Setup Timer 1 on interrupt
   // Create semaphore to inform us when the timer has fired
@@ -504,6 +496,32 @@ void setup() {
   timerAlarmWrite(timer, 1000000/4, true);
   // Start an alarm
   timerAlarmEnable(timer);
+
+  // Setup PWM channels
+  double startFreq = 500.0;
+  // configure LED PWM functionalitites
+  ledcSetup(LED1_PWM_CHANNEL, startFreq, LED_PWM_RESOLUTION);
+  ledcSetup(LED2_PWM_CHANNEL, startFreq, LED_PWM_RESOLUTION);
+  ledcSetup(LED3_PWM_CHANNEL, startFreq, LED_PWM_RESOLUTION);
+  // Attach the channel to the GPIO to be controlled
+  ledcAttachPin(LED1_PIN, LED1_PWM_CHANNEL);
+  ledcAttachPin(LED2_PIN, LED2_PWM_CHANNEL);
+  ledcAttachPin(LED3_PIN, LED3_PWM_CHANNEL);
+  // Set initial duty now, to avoid things being too bright at startup...
+  ledcWrite(LED1_PWM_CHANNEL, programVars.pwmDutyThou);
+  ledcWrite(LED2_PWM_CHANNEL, programVars.pwmDutyThou);
+  ledcWrite(LED3_PWM_CHANNEL, programVars.pwmDutyThou);
+
+  // Make onboard LED mimic LED1
+  ledcAttachPin(LED_ONBOARD_PIN, LED1_PWM_CHANNEL);
+
+  // Initialise the serial hardware at baude 115200
+  Serial.begin(115200);
+ 
+  // Initialise the Bluetooth hardware with a name 'ESP32'
+  if(!SerialBT.begin("ESP32")){
+    Serial.println("An error occurred initializing Bluetooth");
+  }
 
   // Build lookup tables for freq modulation
   // This replaces the giant switch/case statement and adds linear interpolation between values...
@@ -536,24 +554,6 @@ void setup() {
     KeyPoint { 370, 1 },
   };
   buildLookupTable(keypoints, sizeof(keypoints)/sizeof(KeyPoint), freqDeltaLut, sizeof(freqDeltaLut)/sizeof(float));
-
-  // Setup PWM channels
-  double startFreq = 500.0;
-  // configure LED PWM functionalitites
-  ledcSetup(LED1_PWM_CHANNEL, startFreq, LED_PWM_RESOLUTION);
-  ledcSetup(LED2_PWM_CHANNEL, startFreq, LED_PWM_RESOLUTION);
-  ledcSetup(LED3_PWM_CHANNEL, startFreq, LED_PWM_RESOLUTION);
-  // Attach the channel to the GPIO to be controlled
-  ledcAttachPin(LED1_PIN, LED1_PWM_CHANNEL);
-  ledcAttachPin(LED2_PIN, LED2_PWM_CHANNEL);
-  ledcAttachPin(LED3_PIN, LED3_PWM_CHANNEL);
-  // Set initial duty now, to avoid things being too bright at startup...
-  ledcWrite(LED1_PWM_CHANNEL, programVars.pwmDutyThou);
-  ledcWrite(LED2_PWM_CHANNEL, programVars.pwmDutyThou);
-  ledcWrite(LED3_PWM_CHANNEL, programVars.pwmDutyThou);
-
-  // Make onboard LED mimic LED1
-  ledcAttachPin(LED_ONBOARD_PIN, LED1_PWM_CHANNEL);
 
   // Setup frequency measure timer
   // sets pin high
