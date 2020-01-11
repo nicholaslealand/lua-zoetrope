@@ -21,6 +21,7 @@
  **/
 #include "BluetoothSerial.h"
 
+// Length of frequency changes 
 #define COOL_PERIOD_SECONDS           400
 
 // Argument type defines
@@ -29,24 +30,36 @@
 #define ARGUMENT_TYPE_DOUBLE          2
 #define ARGUMENT_TYPE_STRING          3
 
-// Defines
 // Motor to Zeo rotation conversion factor
 #define MOTOR_ZEO_GEARING_FACTOR      4.19
 // to move to slower sensor I have multiplied this factor by 14.099
 // average motor sensor is 17.019 ms avare head sensor is 239.95ms
 // #define MOTOR_ZEO_GEARING_FACTOR      0.29 this is pretty good for the orange belt
 // #define MOTOR_ZEO_GEARING_FACTOR      0.275 this is using the elastic band
+
 // The 'pin' the LED is on - In the case of NodeMCU pin2 is the onboard led
 #define LED_ONBOARD_PIN               2
-#define LED_PIN                       12
-// DEVKIT V1 uses pin 23
-// #define LED_PIN               23
-// The PWM channel for the LED 0 to 15
-#define LED_PWM_CHANNEL               0
+
 // PWM resolution in bits
 #define LED_PWM_RESOLUTION            8
 // PWM inital duty
-#define LED_PWM_INITAL_DUTY           5
+#define LED_PWM_INITIAL_DUTY           5
+
+// We set up for three LEDs to be controlled...
+// DEVKIT V1 uses pin 23
+// #define LED1_PIN               23
+#define LED1_PIN                       12
+// The PWM channel for the LED 0 to 15
+#define LED1_PWM_CHANNEL               0
+
+#define LED2_PIN                       13
+// The PWM channel for the LED 0 to 15
+#define LED2_PWM_CHANNEL               1
+
+#define LED3_PIN                       14
+// The PWM channel for the LED 0 to 15
+#define LED3_PWM_CHANNEL               2
+
 
 // Frequency measure
 #define FREQ_MEASURE_PIN              19
@@ -54,7 +67,7 @@
 #define FREQ_MEASURE_TIMER_PRESCALAR  80
 #define FREQ_MEASURE_TIMER_COUNT_UP   true
 #define FREQ_MEASURE_TIMER_PERIOD     FREQ_MEASURE_TIMER_PRESCALAR/F_CPU
-#define FREQ_MEASUER_SAMPLE_NUM       128
+#define FREQ_MEASURE_SAMPLE_NUM       128
 // this returns a pointer to the hw_timer_t global variable
 // 0 = first timer
 // 80 is prescaler so 80MHZ divided by 80 = 1MHZ signal ie 0.000001 of a second
@@ -83,7 +96,7 @@ volatile uint64_t StartValue;                     // First interrupt value
 bool fAdded = false;
 // Our own Ring Buffer
 uint8_t ringIndex = 0;
-uint64_t myRing[FREQ_MEASUER_SAMPLE_NUM] = {0};
+uint64_t myRing[FREQ_MEASURE_SAMPLE_NUM] = {0};
 // average freq intermediate values as globals. Bite me!
 uint64_t sumPeriod;
 float avgPeriod;
@@ -93,6 +106,8 @@ long prevFreq = 0;
 hw_timer_t * fTimer = NULL;                       // pointer to a variable of type hw_timer_t 
 portMUX_TYPE fTimerMux = portMUX_INITIALIZER_UNLOCKED;  // synchs between maon cose and interrupt?
 
+// Store the delta changes
+float freqDeltaLut[COOL_PERIOD_SECONDS];
 
 // Digital Event Interrupt
 // Enters on falling edge in this example
@@ -103,7 +118,7 @@ void IRAM_ATTR handleFrequencyMeasureInterrupt()
       // uint8_t blah = 8;
       // value of timer at interrupt
       uint64_t TempVal= timerRead(fTimer);
-      if (ringIndex == FREQ_MEASUER_SAMPLE_NUM -1 ) {
+      if (ringIndex == FREQ_MEASURE_SAMPLE_NUM -1 ) {
         ringIndex = 0;
       } else {
         ringIndex++;
@@ -146,7 +161,7 @@ ProgramVars programVars = {
   0,      // pwmFreq
   0,      // setFreq
   false,  // useSetFreq
-  LED_PWM_INITAL_DUTY,      // pwmDutyThou
+  LED_PWM_INITIAL_DUTY,      // pwmDutyThou
   1.0,    // freqDelta
   true,    // runVariableDelta
   MOTOR_ZEO_GEARING_FACTOR, // freqConversionFactor
@@ -418,371 +433,50 @@ double calculateFinalFrequency(float avgPeriod, double conversionFactor) {
   return frequencyAtMotor * conversionFactor;
 }
 
+struct KeyPoint {
+  uint16_t t;
+  float freqDelta;
+};
+
+void buildLookupTable(KeyPoint *keypoints, uint16_t num_keypoints, float* lookup_table, uint16_t lookup_table_size) {
+  float default_freqDelta = 1.0;
+  // Without any keypoints, just set all entries zero
+  if (num_keypoints == 0) {
+    for (int i=0; i < lookup_table_size; i++) {
+      lookup_table[i] = default_freqDelta;
+    }
+  }
+  KeyPoint last_point;
+  int start_idx;
+  if (keypoints[0].t != 0) {
+    last_point = KeyPoint { 0, default_freqDelta };
+    start_idx = 0;
+  } else {
+    last_point = keypoints[0];
+    start_idx = 1;
+  }
+  
+  int lut_idx = 0;
+  for (int i=start_idx; i < num_keypoints; i++) {
+    while (lut_idx <= keypoints[i].t && lut_idx < lookup_table_size) {
+      // Just using linear interpolation for now
+      // TODO maybe smooth keypoints with splines if you want to get fancy...
+      lookup_table[lut_idx] = last_point.freqDelta + ((keypoints[i].freqDelta - last_point.freqDelta) / (keypoints[i].t - last_point.t));
+      lut_idx++;
+    } 
+  }
+  while (lut_idx < lookup_table_size) {
+    lookup_table[lut_idx + 1] = lookup_table[lut_idx];
+    lut_idx++;
+  }
+}
+
 /** This function modifies the delta/modifier based on the timestamp in seconds
  * on a cycle (hence the modulo)
  **/
 void makeShitCoolAgain(uint32_t timestamp, ProgramVars *programVars) {
   uint32_t relativeTime = timestamp % COOL_PERIOD_SECONDS;
-
-  switch(relativeTime) {
-    case 0:
-      programVars->freqDelta = 1.0;
-      break;
-    case 1:
-      programVars->freqDelta = 1.0;
-      break;
-    case 102:
-      programVars->freqDelta = 1.1;
-      break;
-    case 103:
-      programVars->freqDelta = 1.2;
-      break;
-    case 104:
-      programVars->freqDelta = 1.3;
-      break;
-    case 105:
-      programVars->freqDelta = 1.4;
-      break;
-    case 106:
-      programVars->freqDelta = 1.5;
-      break;
-    case 107:
-      programVars->freqDelta = 1.6;
-      break;
-    case 108:
-      programVars->freqDelta = 1.7;
-      break;
-    case 109:
-      programVars->freqDelta = 1.8;
-      break;
-    case 110:
-      programVars->freqDelta = 1.9;
-      break;
-    case 111:
-      programVars->freqDelta = 2.0;
-      break;
-    case 112:
-      programVars->freqDelta = 2.0;
-      break;
-    case 113:
-      programVars->freqDelta = 2.0;
-      break;
-    case 114:
-      programVars->freqDelta = 2.0;
-      break;
-    case 115:
-      programVars->freqDelta = 2.0;
-      break;
-    case 116:
-      programVars->freqDelta = 2.0;
-      break;
-    case 117:
-      programVars->freqDelta = 2.0;
-      break;
-    case 118:
-      programVars->freqDelta = 2.0;
-      break;
-    case 119:
-      programVars->freqDelta = 2.0;
-      break;
-    case 120:
-      programVars->freqDelta = 2.0;
-      break;
-    case 121:
-      programVars->freqDelta = 2.0;
-      break;
-    case 122:
-      programVars->freqDelta = 2.0;
-      break;
-    case 123:
-      programVars->freqDelta = 2.0;
-      break;
-    case 124:
-      programVars->freqDelta = 2.0;
-      break;
-    case 125:
-      programVars->freqDelta = 2.0;
-      break;
-    case 126:
-      programVars->freqDelta = 2.0;
-      break;
-    case 127:
-      programVars->freqDelta = 2.0;
-      break;
-    case 128:
-      programVars->freqDelta = 2.0;
-      break;
-    case 129:
-      programVars->freqDelta = 2.0;
-      break;
-    case 130:
-      programVars->freqDelta = 2.1;
-      break;
-    case 131:
-      programVars->freqDelta = 2.2;
-      break;
-    case 132:
-      programVars->freqDelta = 2.3;
-      break;
-    case 133:
-      programVars->freqDelta = 2.4;
-      break;
-    case 134:
-      programVars->freqDelta = 2.5;
-      break;
-    case 135:
-      programVars->freqDelta = 2.6;
-      break;
-    case 136:
-      programVars->freqDelta = 2.7;
-      break;
-    case 137:
-      programVars->freqDelta = 2.8;
-      break;
-    case 138:
-      programVars->freqDelta = 2.9;
-      break;
-    case 139:
-      programVars->freqDelta = 3.0;
-      break;
-    case 140:
-      programVars->freqDelta = 3.0;
-      break;
-    case 141:
-      programVars->freqDelta = 3.0;
-      break;
-    case 142:
-      programVars->freqDelta = 3.0;
-      break;
-    case 143:
-      programVars->freqDelta = 3.0;
-      break;
-    case 144:
-      programVars->freqDelta = 3.0;
-      break;
-    case 145:
-      programVars->freqDelta = 3.0;
-      break;
-    case 146:
-      programVars->freqDelta = 3.0;
-      break;
-    case 147:
-      programVars->freqDelta = 3.0;
-      break;
-    case 148:
-      programVars->freqDelta = 3.0;
-      break;
-    case 149:
-      programVars->freqDelta = 3.0;
-      break;
-    case 150:
-      programVars->freqDelta = 3.0;
-      break;
-    case 151:
-      programVars->freqDelta = 3.1;
-      break;
-    case 152:
-      programVars->freqDelta = 3.2;
-      break;
-    case 153:
-      programVars->freqDelta = 3.3;
-      break;
-    case 154:
-      programVars->freqDelta = 3.3;
-      break;
-    case 155:
-      programVars->freqDelta = 3.4;
-      break;
-    case 156:
-      programVars->freqDelta = 3.5;
-      break;
-    case 157:
-      programVars->freqDelta = 3.6;
-      break;
-    case 158:
-      programVars->freqDelta = 3.7;
-      break;
-    case 159:
-      programVars->freqDelta = 3.8;
-      break;
-    case 160:
-      programVars->freqDelta = 3.9;
-      break;
-    case 161:
-      programVars->freqDelta = 4.0;
-      break;
-    case 162:
-      programVars->freqDelta = 4.0;
-      break;
-    case 163:
-      programVars->freqDelta = 4.0;
-      break;
-    case 164:
-      programVars->freqDelta = 4.0;
-      break;
-    case 165:
-      programVars->freqDelta = 4.0;
-      break;
-    case 166:
-      programVars->freqDelta = 4.0;
-      break;
-    case 167:
-      programVars->freqDelta = 4.0;
-      break;
-    case 168:
-      programVars->freqDelta = 4.0;
-      break;
-    case 169:
-      programVars->freqDelta = 4.0;
-      break;
-    case 170:
-      programVars->freqDelta = 4.0;
-      break;
-    case 171:
-      programVars->freqDelta = 4.0;
-      break;
-    case 172:
-      programVars->freqDelta = 4.0;
-      break;
-    case 173:
-      programVars->freqDelta = 4.0;
-      break;
-    case 174:
-      programVars->freqDelta = 4.0;
-      break;
-    case 175:
-      programVars->freqDelta = 4.0;
-      break;
-    case 176:
-      programVars->freqDelta = 4.0;
-      break;
-    case 177:
-      programVars->freqDelta = 4.0;
-      break;
-    case 178:
-      programVars->freqDelta = 4.0;
-      break;
-    case 179:
-      programVars->freqDelta = 4.0;
-      break;
-    case 180:
-      programVars->freqDelta = 4.0;
-      break;
-    case 181:
-      programVars->freqDelta = 3.9;
-      break;
-    case 182:
-      programVars->freqDelta = 3.8;
-      break;
-    case 183:
-      programVars->freqDelta = 3.5;
-      break;
-    case 184:
-      programVars->freqDelta = 3.2;
-      break;
-    case 185:
-      programVars->freqDelta = 3.0;
-      break;
-    case 186:
-      programVars->freqDelta = 2.9;
-      break;
-    case 187:
-      programVars->freqDelta = 2.7;
-      break;
-    case 188:
-      programVars->freqDelta = 2.4;
-      break;
-    case 189:
-      programVars->freqDelta = 2.3;
-      break;
-    case 190:
-      programVars->freqDelta = 2.2;
-      break;
-    case 191:
-      programVars->freqDelta = 2.1;
-      break;
-    case 192:
-      programVars->freqDelta = 1.9;
-      break;
-    case 193:
-      programVars->freqDelta = 1.8;
-      break;
-    case 194:
-      programVars->freqDelta = 1.7;
-      break;
-    case 195:
-      programVars->freqDelta = 1.6;
-      break;
-    case 196:
-      programVars->freqDelta = 1.5;
-      break;
-    case 197:
-      programVars->freqDelta = 1.4;
-      break;
-    case 198:
-      programVars->freqDelta = 1.3;
-      break;
-    case 199:
-      programVars->freqDelta = 1.2;
-      break;
-    case 200:
-      programVars->freqDelta = 1.1;
-      break;
-    case 210:
-      programVars->freqDelta = 1.0;
-      break;
-    case 215:
-      programVars->freqDelta = 1.95;
-      break;
-    case 220:
-      programVars->freqDelta = 1.9;
-      break;
-    case 230:
-      programVars->freqDelta = 1.8;
-      break;
-    case 235:
-      programVars->freqDelta = 1.7;
-      break;
-    case 240:
-      programVars->freqDelta = 1.6;
-      break;
-    case 245:
-      programVars->freqDelta = 1.5;
-      break;
-    case 250:
-      programVars->freqDelta = 1.4;
-      break;
-    case 260:
-      programVars->freqDelta = 1.3;
-      break;
-    case 270:
-      programVars->freqDelta = 1.2;
-      break;
-    case 280:
-      programVars->freqDelta = 1.1;
-      break;
-    case 290:
-      programVars->freqDelta = 1.05;
-      break;
-    case 300:
-      programVars->freqDelta = 1.01;
-      break;
-    case 330:
-      programVars->freqDelta = 1;
-      break;
-    case 340:
-      programVars->freqDelta = 5;
-      break;
-      case 350:
-      programVars->freqDelta = 1;
-      break;
-      case 360:
-      programVars->freqDelta = 5;
-      break;
-      case 370:
-      programVars->freqDelta = 1;
-      break;
-  }
+  programVars->freqDelta = freqDeltaLut[relativeTime];
 }
 
 
@@ -811,15 +505,55 @@ void setup() {
   // Start an alarm
   timerAlarmEnable(timer);
 
+  // Build lookup tables for freq modulation
+  // This replaces the giant switch/case statement and adds linear interpolation between values...
+  KeyPoint keypoints[] = {
+    KeyPoint { 0, 1.0 },
+    KeyPoint { 101, 1.0 },
+    KeyPoint { 102, 1.1 },
+    KeyPoint { 111, 2.0 },
+    KeyPoint { 129, 2.0 },
+    KeyPoint { 139, 3.0 },
+    KeyPoint { 150, 3.0 },
+    KeyPoint { 161, 4.0 },
+    KeyPoint { 180, 4.0 },
+    KeyPoint { 200, 1.1 },
+    KeyPoint { 210, 1.0 },
+    KeyPoint { 200, 1.1 },
+    KeyPoint { 214, 1.1 },
+    KeyPoint { 215, 1.95 },
+    KeyPoint { 220, 1.9 },
+    KeyPoint { 230, 1.8 },
+    KeyPoint { 250, 1.4 },
+    KeyPoint { 260, 1.3 },
+    KeyPoint { 280, 1.1 },
+    KeyPoint { 290, 1.05 },
+    KeyPoint { 300, 1.01 },
+    KeyPoint { 330, 1 },
+    KeyPoint { 340, 5 },
+    KeyPoint { 350, 1 },
+    KeyPoint { 360, 5 },
+    KeyPoint { 370, 1 },
+  };
+  buildLookupTable(keypoints, sizeof(keypoints)/sizeof(KeyPoint), freqDeltaLut, sizeof(freqDeltaLut)/sizeof(float));
 
-  // Attach an LED thingee
+  // Setup PWM channels
+  double startFreq = 500.0;
   // configure LED PWM functionalitites
-  // ledcSetup(LED_PWM_CHANNEL, programVars.pwmFreq, LED_PWM_RESOLUTION);
-  ledcSetup(LED_PWM_CHANNEL, 500, LED_PWM_RESOLUTION);
-  // attach the channel to the GPIO to be controlled
-  ledcAttachPin(LED_ONBOARD_PIN, LED_PWM_CHANNEL);
-  ledcAttachPin(LED_PIN, LED_PWM_CHANNEL);
-  ledcWrite(LED_PWM_CHANNEL, programVars.pwmDutyThou);
+  ledcSetup(LED1_PWM_CHANNEL, startFreq, LED_PWM_RESOLUTION);
+  ledcSetup(LED2_PWM_CHANNEL, startFreq, LED_PWM_RESOLUTION);
+  ledcSetup(LED3_PWM_CHANNEL, startFreq, LED_PWM_RESOLUTION);
+  // Attach the channel to the GPIO to be controlled
+  ledcAttachPin(LED1_PIN, LED1_PWM_CHANNEL);
+  ledcAttachPin(LED2_PIN, LED2_PWM_CHANNEL);
+  ledcAttachPin(LED3_PIN, LED3_PWM_CHANNEL);
+  // Set initial duty now, to avoid things being too bright at startup...
+  ledcWrite(LED1_PWM_CHANNEL, programVars.pwmDutyThou);
+  ledcWrite(LED2_PWM_CHANNEL, programVars.pwmDutyThou);
+  ledcWrite(LED3_PWM_CHANNEL, programVars.pwmDutyThou);
+
+  // Make onboard LED mimic LED1
+  ledcAttachPin(LED_ONBOARD_PIN, LED1_PWM_CHANNEL);
 
   // Setup frequency measure timer
   // sets pin high
@@ -830,6 +564,23 @@ void setup() {
   fTimer = timerBegin(FREQ_MEASURE_TIMER, FREQ_MEASURE_TIMER_PRESCALAR, FREQ_MEASURE_TIMER_COUNT_UP);
   // Start the timer
   timerStart(fTimer);
+}
+
+inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars) {
+  if (programVars.runVariableDelta == true) {
+    makeShitCoolAgain(timestamp, &programVars);
+  }
+
+  // Change the PWM freq if it has changed
+  if ( programVars.pwmFreq != prevFreq) {
+    ledcWriteTone(pwm_channel, programVars.pwmFreq);
+    prevFreq = programVars.pwmFreq;
+    if (programVars.ledEnable == true) {
+      ledcWrite(pwm_channel, programVars.pwmDutyThou);
+    } else {
+      ledcWrite(pwm_channel, 0);
+    }
+  }
 }
  
 void loop() {
@@ -860,11 +611,11 @@ void loop() {
       } else {
         // calculate the frequency from the average period
         sumPeriod = 0;
-        for (int i = 0; i < FREQ_MEASUER_SAMPLE_NUM; ++i)
+        for (int i = 0; i < FREQ_MEASURE_SAMPLE_NUM; ++i)
         {
             sumPeriod += myRing[i];
         }
-        avgPeriod = ((float)sumPeriod)/FREQ_MEASUER_SAMPLE_NUM; //or cast sum to double before division
+        avgPeriod = ((float)sumPeriod)/FREQ_MEASURE_SAMPLE_NUM; //or cast sum to double before division
         programVars.pwmFreq = calculateFinalFrequency(avgPeriod, programVars.freqConversionFactor) * programVars.freqDelta;
       }
 
@@ -876,10 +627,14 @@ void loop() {
       SerialBT.println(messages);
       // We need to change duty to 0 if LED is disabled
       if (programVars.ledEnable == true) {
-        ledcWrite(LED_PWM_CHANNEL, programVars.pwmDutyThou);
+        ledcWrite(LED1_PWM_CHANNEL, programVars.pwmDutyThou);
+        ledcWrite(LED2_PWM_CHANNEL, programVars.pwmDutyThou);
+        ledcWrite(LED3_PWM_CHANNEL, programVars.pwmDutyThou);
       } else {
         messages = "Disabling LED";
-        ledcWrite(LED_PWM_CHANNEL, 0);
+        ledcWrite(LED1_PWM_CHANNEL, 0);
+        ledcWrite(LED2_PWM_CHANNEL, 0);
+        ledcWrite(LED3_PWM_CHANNEL, 0);
       }
     }
 
@@ -889,20 +644,9 @@ void loop() {
       timestamp++;
       timestampQuarter = 0;
 
-      if (programVars.runVariableDelta == true) {
-        makeShitCoolAgain(timestamp, &programVars);
-      }
-
-      // Change the PWM freq if it has changed
-      if ( programVars.pwmFreq != prevFreq) {
-        ledcWriteTone(LED_PWM_CHANNEL, programVars.pwmFreq);
-        prevFreq = programVars.pwmFreq;
-        if (programVars.ledEnable == true) {
-          ledcWrite(LED_PWM_CHANNEL, programVars.pwmDutyThou);
-        } else {
-          ledcWrite(LED_PWM_CHANNEL, 0);
-        }
-      }
+      updateLED(LED1_PWM_CHANNEL, programVars);
+      updateLED(LED2_PWM_CHANNEL, programVars);
+      updateLED(LED3_PWM_CHANNEL, programVars);
 
       // print logging info if enabled
       if (programVars.logging == true) {
