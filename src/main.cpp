@@ -612,13 +612,16 @@ inline void roll_the_dice(ProgramVars& programVars) {
     }
     if (first_led != NUM_LEDS) {
       programVars.ledEnable[first_led] = true;
-      programVars.patternSpeed[first_led] = 1.0f;
-      programVars.patternOffset[first_led] = 10;
+      // 0.9 - 1.1
+      programVars.patternSpeed[first_led] = 0.9f + (((float) random(0, 20)) * 0.01);
+      programVars.patternOffset[first_led] = random(0, COOL_PERIOD_SECONDS);
     }
     if (second_led != NUM_LEDS) {
       programVars.ledEnable[second_led] = true;
-      programVars.patternSpeed[second_led] = 1.1f;
-      programVars.patternOffset[second_led] = 10;
+      // 1.1 - 1.4
+      programVars.patternSpeed[second_led] = 1.1f + (((float) random(0, 30)) * 0.01);
+      programVars.patternOffset[second_led] = random(0, COOL_PERIOD_SECONDS);
+      
     }
 
     randomisation_cooldown = RANDOM_COOLDOWN_PERIOD;
@@ -706,7 +709,7 @@ void loop() {
       timestamp++;
       timestampQuarter = 0;
 
-      // This is code for running each led briefly at startup
+      // optionally run each led briefly at startup
       uint32_t total_test_period = LED_TEST_PERIOD * NUM_LEDS;
       if (do_test && test_progress < total_test_period) {
         uint8_t current_led = test_progress / NUM_LEDS;
@@ -714,6 +717,9 @@ void loop() {
           programVars.ledEnable[i] = false;
         }
         programVars.ledEnable[current_led] = true;
+        programVars.patternSpeed[current_led] = 1.0f;
+        // start the current test led from the start of the pattern
+        programVars.patternOffset[current_led] = (2 * COOL_PERIOD_SECONDS - timestamp) % COOL_PERIOD_SECONDS;
 
         test_progress++;
         if (test_progress >= total_test_period) {
@@ -721,6 +727,8 @@ void loop() {
           test_progress = 0;
         }
       } else if (do_randomisation) {
+        // select some random LED parameters, including which LEDs are
+        // actually on
         roll_the_dice(programVars);
       }
 
