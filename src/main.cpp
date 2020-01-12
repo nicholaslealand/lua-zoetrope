@@ -47,22 +47,11 @@
 
 // We set up for three LEDs to be controlled...
 // DEVKIT V1 uses pin 23
-// #define LED1_PIN               23
-#define LED1_PIN                       13
-// The PWM channel for the LED 0 to 15
-#define LED1_PWM_CHANNEL               0
-
-#define LED2_PIN                       14
-// The PWM channel for the LED 0 to 15
-#define LED2_PWM_CHANNEL               1
-
-#define LED3_PIN                       15
-// The PWM channel for the LED 0 to 15
-#define LED3_PWM_CHANNEL               2
-
-#define NUM_LEDS 3
+#define NUM_LEDS 4
+uint16_t led_pins[NUM_LEDS] = {13, 14, 15, 16};
+uint8_t led_channels[NUM_LEDS] = {0, 1, 2, 3};
 // prev freq for freq compare, 
-long prevFreqs[NUM_LEDS] = {0, 0, 0};
+long prevFreqs[NUM_LEDS] = {0, 0, 0, 0};
 
 // Frequency measure
 #define FREQ_MEASURE_PIN              19
@@ -97,15 +86,17 @@ void IRAM_ATTR onTimer(){
 /** Timer for measuring freq **/
 volatile uint64_t StartValue;                     // First interrupt value
 bool fAdded = false;
-// Our own Ring Buffer
+// Ring Buffer
 uint8_t ringIndex = 0;
 uint64_t myRing[FREQ_MEASURE_SAMPLE_NUM] = {0};
 // average freq intermediate values as globals. Bite me!
 uint64_t sumPeriod;
 float avgPeriod;
 
-hw_timer_t * fTimer = NULL;                       // pointer to a variable of type hw_timer_t 
-portMUX_TYPE fTimerMux = portMUX_INITIALIZER_UNLOCKED;  // synchs between maon cose and interrupt?
+// pointer to a variable of type hw_timer_t 
+hw_timer_t * fTimer = NULL;
+// syncs between main and interrupt
+portMUX_TYPE fTimerMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Store the delta changes
 float freqDeltaLut[COOL_PERIOD_SECONDS];
@@ -148,6 +139,15 @@ BluetoothSerial SerialBT;
 String serialBuffer = "";
 String messages;
 
+// This will run each LED for 5 seconds, before letting things proceed normally
+bool do_test = true;
+uint32_t test_progress = 0;
+#define LED_TEST_PERIOD 5
+// Set to true to disable randomised changes to led parameters/patterns
+bool do_randomisation = false;
+uint32_t randomisation_cooldown = 0;
+#define RANDOM_COOLDOWN_PERIOD 60;
+
 // A 'struct' is an object containing other variables
 // This defines the struct data type
 struct ProgramVars {
@@ -156,26 +156,30 @@ struct ProgramVars {
   bool    useSetFreq;
   long    pwmDutyThou;
   double  freqDelta[NUM_LEDS];
+  int     patternOffset[NUM_LEDS];
+  float   patternSpeed[NUM_LEDS];
   bool    runVariableDelta;
   double  freqConversionFactor;
-  bool    ledEnable;
+  bool    ledEnable[NUM_LEDS];
   bool    logging;
   bool    stateChange;
   String  randomString;
 };
 // This creates a new variable which is of the above struct type
 ProgramVars programVars = {
-  {0, 0, 0},      // pwmFreq
+  {0, 0, 0, 0},      // pwmFreq
   0,      // setFreq
   false,  // useSetFreq
   LED_PWM_INITIAL_DUTY,      // pwmDutyThou
-  {1.0, 1.0, 1.0},    // freqDelta
+  {1.0, 1.0, 1.0, 1.0},    // freqDelta
+  {0, 50, 100, 150}, // patternOffset
+  {1.0f, 1.0f, 1.0f, 1.0f}, // patternSpeed
   true,    // runVariableDelta
   MOTOR_ZEO_GEARING_FACTOR, // freqConversionFactor
-  true,   // ledEnable
-  false,  //  logging
+  {true, false, false, false},   // ledEnable
+  false,  // logging
   false,  // stateChange
-  ""      //randomString
+  ""      // randomString
 };
 
 
@@ -399,9 +403,9 @@ ProgramVars programVars = {
       progVars->stateChange = argDisplayOrSetLong("pwmDuty", comArgState, &progVars->pwmDutyThou, message);
       break;
     case 'm':
-      progVars->stateChange = argDisplayOrSetDoubleFromLong("freqDelta", comArgState, &progVars->freqDelta[0], 100, message);
-      progVars->stateChange = argDisplayOrSetDoubleFromLong("freqDelta", comArgState, &progVars->freqDelta[1], 100, message);
-      progVars->stateChange = argDisplayOrSetDoubleFromLong("freqDelta", comArgState, &progVars->freqDelta[2], 100, message);
+      for (int i=0; i < NUM_LEDS; i++) {
+        progVars->stateChange |= argDisplayOrSetDoubleFromLong("freqDelta", comArgState, &progVars->freqDelta[i], 100, message);
+      }
       break;
     case 'v':
       progVars->stateChange = argDisplayOrSetBoolean("runVariableDelta", comArgState, &progVars->runVariableDelta, message);
@@ -413,7 +417,9 @@ ProgramVars programVars = {
       progVars->stateChange = argDisplayOrSetString("randomString", comArgState, &progVars->randomString, message);
       break;
     case 'l':
-      progVars->stateChange = argDisplayOrSetBoolean("ledEnable", comArgState, &progVars->ledEnable, message);
+      for (int i=0; i < NUM_LEDS; i++) {
+        progVars->stateChange |= argDisplayOrSetBoolean("ledEnable", comArgState, &progVars->ledEnable[i], message);
+      }
       break;
     case 'L':
       progVars->stateChange = argDisplayOrSetBoolean("logging", comArgState, &progVars->logging, message);
@@ -426,16 +432,22 @@ ProgramVars programVars = {
     return EXIT_SUCCESS;
   }
 
+
+template<typename T> String arrayToString(T* array, uint32_t len) {
+  String result = "[";
+  for (uint32_t i=0; i < len - 1; i++) {
+    result += String(array[i]) + ", ";
+  }
+  result + "]";
+  return result;
+}
+
 String formatProgVars(long time, ProgramVars progVars) {
-  return String(time) + " ledEnable: " + String(progVars.ledEnable) +
+  return String(time) + " ledEnable: " + arrayToString(progVars.ledEnable, NUM_LEDS) +
     " setFreq: " + String(progVars.setFreq) +
-    " pwmFreq: [" + String(progVars.pwmFreq[0]) + ", " +
-    String(progVars.pwmFreq[1]) + ", " +
-    String(progVars.pwmFreq[2]) + "]" +
+    " pwmFreq: [" + arrayToString(progVars.pwmFreq, NUM_LEDS) +
     " pwmDuty: " + String(progVars.pwmDutyThou) +
-    " freqDelta: " + String(progVars.freqDelta[0]) + ", " +
-    String(progVars.freqDelta[1]) + ", " +
-    String(progVars.freqDelta[2]) + "]" +
+    " freqDelta: " + arrayToString(progVars.freqDelta, NUM_LEDS) +
     " pwmDuty: " + String(progVars.pwmDutyThou) +
     " Random string: '" + progVars.randomString +"'";
 }
@@ -503,21 +515,18 @@ void setup() {
 
   // Setup PWM channels
   double startFreq = 500.0;
-  // configure LED PWM functionalitites
-  ledcSetup(LED1_PWM_CHANNEL, startFreq, LED_PWM_RESOLUTION);
-  ledcSetup(LED2_PWM_CHANNEL, startFreq, LED_PWM_RESOLUTION);
-  ledcSetup(LED3_PWM_CHANNEL, startFreq, LED_PWM_RESOLUTION);
-  // Attach the channel to the GPIO to be controlled
-  ledcAttachPin(LED1_PIN, LED1_PWM_CHANNEL);
-  ledcAttachPin(LED2_PIN, LED2_PWM_CHANNEL);
-  ledcAttachPin(LED3_PIN, LED3_PWM_CHANNEL);
-  // Set initial duty now, to avoid things being too bright at startup...
-  ledcWrite(LED1_PWM_CHANNEL, programVars.pwmDutyThou);
-  ledcWrite(LED2_PWM_CHANNEL, programVars.pwmDutyThou);
-  ledcWrite(LED3_PWM_CHANNEL, programVars.pwmDutyThou);
-
+  for (int i=0; i<NUM_LEDS; i++) {
+    // configure LED PWM functionalitites
+    ledcSetup(led_channels[i], startFreq, LED_PWM_RESOLUTION);
+  
+    // Attach the channel to the GPIO to be controlled
+    ledcAttachPin(led_pins[i], led_channels[i]);
+  
+    // Set initial duty now, to avoid things being too bright at startup...
+    ledcWrite(led_channels[i], programVars.pwmDutyThou);
+  }
   // Make onboard LED mimic LED1
-  ledcAttachPin(LED_ONBOARD_PIN, LED1_PWM_CHANNEL);
+  ledcAttachPin(LED_ONBOARD_PIN, led_pins[0]);
 
   // Initialise the serial hardware at baude 115200
   Serial.begin(115200);
@@ -570,12 +579,56 @@ void setup() {
   timerStart(fTimer);
 }
 
+inline void roll_the_dice(ProgramVars& programVars) {
+  if (randomisation_cooldown > 0) {
+    randomisation_cooldown -= 1;
+  } else if (random(100) < 10) {
+    // ^ after cooldown, chance of change is 10%
+
+    for (int i=0; i<NUM_LEDS; i++) {
+      programVars.ledEnable[i] = false;
+    }
+    // First select which combo of leds to have active
+    // We have a number of desired combos:
+    // - any single led, NUM_LED options
+    // - any two leds, NUM_LED*(NUM_LED-1) options
+    uint32_t single_or_dual_led = random(0, 1000);
+    // threshold for enabling two leds instead of one
+    uint32_t dual_threshold = 600;
+
+    uint8_t first_led = NUM_LEDS;
+    uint8_t second_led = NUM_LEDS;
+    if (single_or_dual_led < dual_threshold) {
+      first_led = single_or_dual_led / NUM_LEDS;
+    } else {
+      uint16_t first_led_split = (1000 - dual_threshold) / NUM_LEDS;
+      uint16_t second_led_split = first_led_split / (NUM_LEDS - 1);
+
+      first_led = (single_or_dual_led - dual_threshold) / first_led_split;
+      second_led = ((single_or_dual_led - dual_threshold) % first_led_split) / second_led_split;
+      
+      programVars.ledEnable[first_led] = true;
+      programVars.ledEnable[second_led] = true;
+    }
+    if (first_led != NUM_LEDS) {
+      programVars.ledEnable[first_led] = true;
+      programVars.patternSpeed[first_led] = 1.0f;
+      programVars.patternOffset[first_led] = 10;
+    }
+    if (second_led != NUM_LEDS) {
+      programVars.ledEnable[second_led] = true;
+      programVars.patternSpeed[second_led] = 1.1f;
+      programVars.patternOffset[second_led] = 10;
+    }
+
+    randomisation_cooldown = RANDOM_COOLDOWN_PERIOD;
+  }
+}
+
 inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars, uint8_t led) {
   if (programVars.runVariableDelta == true) {
-    uint16_t led_time_offset = led * LED_TIME_OFFSET;
-    float time_multiplier = powf(LED_TIME_MULTIPLIER, led);
     // modifies the delta/modifier based on the timestamp in seconds on a cycle (hence the modulo)
-    uint32_t relativeTime = ((uint32_t)(time_multiplier * timestamp) + led_time_offset) % COOL_PERIOD_SECONDS;
+    uint32_t relativeTime = ((uint32_t)(programVars.patternSpeed[led] * timestamp) + programVars.patternOffset[led]) % COOL_PERIOD_SECONDS;
     programVars.freqDelta[led] = freqDeltaLut[relativeTime];
   }
 
@@ -583,7 +636,7 @@ inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars, uint8_t le
   if ( programVars.pwmFreq[led] != prevFreqs[led]) {
     ledcWriteTone(pwm_channel, programVars.pwmFreq[led]);
     prevFreqs[led] = programVars.pwmFreq[led];
-    if (programVars.ledEnable == true) {
+    if (programVars.ledEnable[led] == true) {
       ledcWrite(pwm_channel, programVars.pwmDutyThou);
     } else {
       ledcWrite(pwm_channel, 0);
@@ -592,7 +645,6 @@ inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars, uint8_t le
 }
  
 void loop() {
- 
   // If Timer has fired do some non-realtime stuff
   if (xSemaphoreTake(timerSemaphore, 0) == pdTRUE){
     // If the buffers end in newline, try to parse the command an arguments
@@ -609,15 +661,13 @@ void loop() {
     }
 
     if (programVars.stateChange == true || fAdded == true) {
-      // reset c flhangeag
       fAdded = false;
       programVars.stateChange = false;
 
-
       if (programVars.useSetFreq) {
-        programVars.pwmFreq[0] = programVars.setFreq;
-        programVars.pwmFreq[1] = programVars.setFreq;
-        programVars.pwmFreq[2] = programVars.setFreq;
+          for (int i=0; i<NUM_LEDS; i++) {
+              programVars.pwmFreq[i] = programVars.setFreq;
+          }
       } else {
         // calculate the frequency from the average period
         sumPeriod = 0;
@@ -627,42 +677,57 @@ void loop() {
         }
         avgPeriod = ((float)sumPeriod)/FREQ_MEASURE_SAMPLE_NUM; //or cast sum to double before division
         float final_freq = calculateFinalFrequency(avgPeriod, programVars.freqConversionFactor);
-        programVars.pwmFreq[0] = final_freq * programVars.freqDelta[0];
-        programVars.pwmFreq[1] = final_freq * programVars.freqDelta[1];
-        programVars.pwmFreq[2] = final_freq * programVars.freqDelta[2];
+        for (int i=0; i<NUM_LEDS; i++) {
+          programVars.pwmFreq[i] = final_freq * programVars.freqDelta[i];
+        }
       }
 
       messages = "Setting PWM duty to: " + String(programVars.pwmDutyThou) + \
-        " Frequency to: [" + String(programVars.pwmFreq[0]) + ", " + \
-        String(programVars.pwmFreq[1]) + ", " + \
-        String(programVars.pwmFreq[2]) + "]" + \
+        " Frequency to: [" + arrayToString(programVars.pwmFreq, NUM_LEDS) + \
         " User set freq to: " + String(programVars.setFreq);
 
       Serial.println(messages);
       SerialBT.println(messages);
-      // We need to change duty to 0 if LED is disabled
-      if (programVars.ledEnable == true) {
-        ledcWrite(LED1_PWM_CHANNEL, programVars.pwmDutyThou);
-        ledcWrite(LED2_PWM_CHANNEL, programVars.pwmDutyThou);
-        ledcWrite(LED3_PWM_CHANNEL, programVars.pwmDutyThou);
-      } else {
-        messages = "Disabling LED";
-        ledcWrite(LED1_PWM_CHANNEL, 0);
-        ledcWrite(LED2_PWM_CHANNEL, 0);
-        ledcWrite(LED3_PWM_CHANNEL, 0);
+      
+      // We need to change duty to 0 if any LED is disabled
+      for (int i=0; i<NUM_LEDS; i++) {
+        if (programVars.ledEnable[i] == true) {
+          ledcWrite(led_channels[i], programVars.pwmDutyThou);
+        } else {
+          messages += " Disabling LED " + i;
+          ledcWrite(led_channels[i], 0);
+        }
       }
     }
 
-    // Timer fires every quarter second, so every four tickes
+    // Timer fires every quarter second, so every four ticks
     // we increment the timestamp and log
-    if (timestampQuarter%4 == 0) {
+    if (timestampQuarter % 4 == 0) {
       timestamp++;
       timestampQuarter = 0;
 
-      updateLED(LED1_PWM_CHANNEL, programVars, 0);
-      updateLED(LED2_PWM_CHANNEL, programVars, 1);
-      updateLED(LED3_PWM_CHANNEL, programVars, 2);
+      // This is code for running each led briefly at startup
+      uint32_t total_test_period = LED_TEST_PERIOD * NUM_LEDS;
+      if (do_test && test_progress < total_test_period) {
+        uint8_t current_led = test_progress / NUM_LEDS;
+        for (int i=0; i<NUM_LEDS; i++) {
+          programVars.ledEnable[i] = false;
+        }
+        programVars.ledEnable[current_led] = true;
 
+        test_progress++;
+        if (test_progress >= total_test_period) {
+          do_test = false;
+          test_progress = 0;
+        }
+      } else if (do_randomisation) {
+        roll_the_dice(programVars);
+      }
+
+      for (int i=0; i<NUM_LEDS; i++) {
+        updateLED(led_channels[i], programVars, 0);
+      }
+      
       // print logging info if enabled
       if (programVars.logging == true) {
         String logMessage = formatProgVars(timestamp, programVars);    
@@ -673,7 +738,7 @@ void loop() {
   }
 
   // While there are characters in the Serial buffer
-  // read them in one at a time into sBuffer
+  // read them in one at a time into serialBuffer
   // We need to go via char probably due to implicit type conversions
   while(Serial.available() > 0){
     char inChar = Serial.read();
@@ -686,10 +751,6 @@ void loop() {
     serialBuffer += inChar;
   }
 
-
-  // Wait 50 ms
-  // ooooo, gross! Don't do that. naa fk ya
-  // delay(50);
 }
 
 // #include "TimerOne.h"
