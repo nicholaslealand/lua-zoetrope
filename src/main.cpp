@@ -144,9 +144,9 @@ bool do_test = true;
 uint32_t test_progress = 0;
 #define LED_TEST_PERIOD 5
 // Set to true to disable randomised changes to led parameters/patterns
-bool do_randomisation = false;
+bool do_randomisation = true;
 uint32_t randomisation_cooldown = 0;
-#define RANDOM_COOLDOWN_PERIOD 60;
+#define RANDOM_COOLDOWN_PERIOD 60
 
 // A 'struct' is an object containing other variables
 // This defines the struct data type
@@ -579,10 +579,10 @@ void setup() {
   timerStart(fTimer);
 }
 
-inline void roll_the_dice(ProgramVars& programVars) {
+inline void roll_the_dice(ProgramVars& programVars, int percentChance) {
   if (randomisation_cooldown > 0) {
     randomisation_cooldown -= 1;
-  } else if (random(100) < 10) {
+  } else if (random(100) < percentChance) {
     // ^ after cooldown, chance of change is 10%
 
     for (int i=0; i<NUM_LEDS; i++) {
@@ -599,7 +599,8 @@ inline void roll_the_dice(ProgramVars& programVars) {
     uint8_t first_led = NUM_LEDS;
     uint8_t second_led = NUM_LEDS;
     if (single_or_dual_led < dual_threshold) {
-      first_led = single_or_dual_led / NUM_LEDS;
+      uint16_t first_led_split = dual_threshold / NUM_LEDS;
+      first_led = single_or_dual_led / first_led_split;
     } else {
       uint16_t first_led_split = (1000 - dual_threshold) / NUM_LEDS;
       uint16_t second_led_split = first_led_split / (NUM_LEDS - 1);
@@ -610,13 +611,13 @@ inline void roll_the_dice(ProgramVars& programVars) {
       programVars.ledEnable[first_led] = true;
       programVars.ledEnable[second_led] = true;
     }
-    if (first_led != NUM_LEDS) {
+    if (first_led < NUM_LEDS) {
       programVars.ledEnable[first_led] = true;
       // 0.9 - 1.1
       programVars.patternSpeed[first_led] = 0.9f + (((float) random(0, 20)) * 0.01);
       programVars.patternOffset[first_led] = random(0, COOL_PERIOD_SECONDS);
     }
-    if (second_led != NUM_LEDS) {
+    if (second_led < NUM_LEDS) {
       programVars.ledEnable[second_led] = true;
       // 1.1 - 1.4
       programVars.patternSpeed[second_led] = 1.1f + (((float) random(0, 30)) * 0.01);
@@ -725,11 +726,13 @@ void loop() {
         if (test_progress >= total_test_period) {
           do_test = false;
           test_progress = 0;
+          // 100% chance of new state
+          roll_the_dice(programVars, 100);
         }
       } else if (do_randomisation) {
         // select some random LED parameters, including which LEDs are
         // actually on
-        roll_the_dice(programVars);
+        roll_the_dice(programVars, 10);
       }
 
       for (int i=0; i<NUM_LEDS; i++) {
