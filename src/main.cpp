@@ -89,9 +89,8 @@ bool fAdded = false;
 // Ring Buffer
 uint8_t ringIndex = 0;
 uint64_t myRing[FREQ_MEASURE_SAMPLE_NUM] = {0};
-// average freq intermediate values as globals. Bite me!
-uint64_t sumPeriod;
-float avgPeriod;
+
+float final_freq;
 
 // pointer to a variable of type hw_timer_t 
 hw_timer_t * fTimer = NULL;
@@ -113,7 +112,6 @@ float freqDeltaLut[COOL_PERIOD_SECONDS];
 void IRAM_ATTR handleFrequencyMeasureInterrupt()
 {
   portENTER_CRITICAL_ISR(&fTimerMux);
-      // uint8_t blah = 8;
       // value of timer at interrupt
       uint64_t TempVal= timerRead(fTimer);
       if (ringIndex == FREQ_MEASURE_SAMPLE_NUM -1 ) {
@@ -121,12 +119,7 @@ void IRAM_ATTR handleFrequencyMeasureInterrupt()
       } else {
         ringIndex++;
       }
-      // // Add period to RunningAverage, period is in number of FREQ_MEASURE_TIMER_PERIOD
-      // // Note: Is timer overflow safe
-      // This one MOFO's
       myRing[ringIndex]= TempVal - StartValue;
-      // frequencyRA.addValue(TempVal - StartValue);
-      // // puts latest reading as start for next calculation
       StartValue = TempVal;
       fAdded = true;
   portEXIT_CRITICAL_ISR(&fTimerMux);
@@ -635,6 +628,18 @@ inline void roll_the_dice(ProgramVars& programVars, int percentChance) {
   }
 }
 
+inline void updateFreq(ProgramVars& programVars) {
+  if (programVars.useSetFreq) {
+    for (int i=0; i<NUM_LEDS; i++) {
+        programVars.pwmFreq[i] = programVars.setFreq;
+    }
+  } else {
+    for (int i=0; i<NUM_LEDS; i++) {
+      programVars.pwmFreq[i] = final_freq * programVars.freqDelta[i];
+    }
+  }
+}
+
 inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars, uint8_t led) {
   if (programVars.runVariableDelta == true) {
     // we need to base timestamp of off when the parameters were last set, otherwise leds with two different patternSpeed values
@@ -642,18 +647,21 @@ inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars, uint8_t le
     uint32_t ts = timestamp - timestamp_of_last_change;
     // modifies the delta/modifier based on the timestamp in seconds on a cycle (hence the modulo)
     uint32_t relativeTime = ((uint32_t)(programVars.patternSpeed[led] * ts) + programVars.patternOffset[led]) % COOL_PERIOD_SECONDS;
+
     programVars.freqDelta[led] = freqDeltaLut[relativeTime];
   }
+  updateFreq(programVars);
 
+  if (programVars.ledEnable[led] == true) {
+    ledcWrite(pwm_channel, programVars.pwmDutyThou);
+  } else {
+    ledcWrite(pwm_channel, 0);
+  }
+  
   // Change the PWM freq if it has changed
   if ( programVars.pwmFreq[led] != prevFreqs[led]) {
     ledcWriteTone(pwm_channel, programVars.pwmFreq[led]);
-    prevFreqs[led] = programVars.pwmFreq[led];
-    if (programVars.ledEnable[led] == true) {
-      ledcWrite(pwm_channel, programVars.pwmDutyThou);
-    } else {
-      ledcWrite(pwm_channel, 0);
-    }
+    prevFreqs[led] = programVars.pwmFreq[led];  
   }
 }
  
@@ -673,44 +681,24 @@ void loop() {
       serialBuffer = "";
     }
 
+    bool do_led_update = false;
     if (programVars.stateChange == true || fAdded == true) {
-      fAdded = false;
-      programVars.stateChange = false;
-
-      if (programVars.useSetFreq) {
-          for (int i=0; i<NUM_LEDS; i++) {
-              programVars.pwmFreq[i] = programVars.setFreq;
-          }
-      } else {
+      if (fAdded) {
         // calculate the frequency from the average period
-        sumPeriod = 0;
+        uint64_t sumPeriod = 0;
         for (int i = 0; i < FREQ_MEASURE_SAMPLE_NUM; ++i)
         {
-            sumPeriod += myRing[i];
+          sumPeriod += myRing[i];
         }
-        avgPeriod = ((float)sumPeriod)/FREQ_MEASURE_SAMPLE_NUM; //or cast sum to double before division
-        float final_freq = calculateFinalFrequency(avgPeriod, programVars.freqConversionFactor);
-        for (int i=0; i<NUM_LEDS; i++) {
-          programVars.pwmFreq[i] = final_freq * programVars.freqDelta[i];
-        }
+        // TODO: This is will calculate an incorrect sum until we have 128 samples
+        float avgPeriod = ((float)sumPeriod)/FREQ_MEASURE_SAMPLE_NUM;
+        final_freq = calculateFinalFrequency(avgPeriod, programVars.freqConversionFactor);
       }
+      // make sure to update leds so that they reflect the new frequency measure
+      do_led_update = true;
 
-      messages = "Setting PWM duty to: " + String(programVars.pwmDutyThou) + \
-        " Frequency to: [" + arrayToString(programVars.pwmFreq, NUM_LEDS) + \
-        " User set freq to: " + String(programVars.setFreq);
-
-      Serial.println(messages);
-      SerialBT.println(messages);
-      
-      // We need to change duty to 0 if any LED is disabled
-      for (int i=0; i<NUM_LEDS; i++) {
-        if (programVars.ledEnable[i] == true) {
-          ledcWrite(led_channels[i], programVars.pwmDutyThou);
-        } else {
-          messages += " Disabling LED " + i;
-          ledcWrite(led_channels[i], 0);
-        }
-      }
+      fAdded = false;
+      programVars.stateChange = false;
     }
 
     // Timer fires every quarter second, so every four ticks
@@ -744,10 +732,14 @@ void loop() {
         roll_the_dice(programVars, 10);
       }
 
+      do_led_update = true;
+    }
+
+    if (do_led_update) {
       for (int i=0; i<NUM_LEDS; i++) {
         updateLED(led_channels[i], programVars, 0);
       }
-      
+
       // print logging info if enabled
       if (programVars.logging == true) {
         String logMessage = formatProgVars(timestamp, programVars);    
