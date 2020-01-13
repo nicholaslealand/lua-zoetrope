@@ -547,6 +547,7 @@ void setup() {
     KeyPoint { 0, 1.0 },
     KeyPoint { 10, 1.5 },
     KeyPoint { 20, 1.0 },
+    KeyPoint { 50, 1.3 },
     KeyPoint { 101, 1.0 },
     KeyPoint { 102, 1.1 },
     KeyPoint { 111, 2.0 },
