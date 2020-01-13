@@ -488,12 +488,14 @@ void buildLookupTable(KeyPoint *keypoints, uint16_t num_keypoints, float* lookup
   
   int lut_idx = 0;
   for (int i=start_idx; i < num_keypoints; i++) {
+    // Just using linear interpolation for now
+    // TODO maybe smooth keypoints with splines if you want to get fancy...
+    float step_size = (keypoints[i].freqDelta - last_point.freqDelta) / (keypoints[i].t - last_point.t);
     while (lut_idx <= keypoints[i].t && lut_idx < lookup_table_size) {
-      // Just using linear interpolation for now
-      // TODO maybe smooth keypoints with splines if you want to get fancy...
-      lookup_table[lut_idx] = last_point.freqDelta + ((keypoints[i].freqDelta - last_point.freqDelta) / (keypoints[i].t - last_point.t));
+      lookup_table[lut_idx] = last_point.freqDelta + ((lut_idx - last_point.t) * step_size);
       lut_idx++;
     } 
+    last_point = keypoints[i];
   }
   while (lut_idx < lookup_table_size - 1) {
     lookup_table[lut_idx + 1] = lookup_table[lut_idx];
