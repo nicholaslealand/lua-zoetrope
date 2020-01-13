@@ -431,17 +431,16 @@ template<typename T> String arrayToString(T* array, uint32_t len) {
   for (uint32_t i=0; i < len - 1; i++) {
     result += String(array[i]) + ", ";
   }
-  result + "]";
+  result += array[len - 1] + "]";
   return result;
 }
 
 String formatProgVars(long time, ProgramVars progVars) {
   return String(time) + " ledEnable: " + arrayToString(progVars.ledEnable, NUM_LEDS) +
     " setFreq: " + String(progVars.setFreq) +
-    " pwmFreq: [" + arrayToString(progVars.pwmFreq, NUM_LEDS) +
+    " pwmFreq: " + arrayToString(progVars.pwmFreq, NUM_LEDS) +
     " pwmDuty: " + String(progVars.pwmDutyThou) +
     " freqDelta: " + arrayToString(progVars.freqDelta, NUM_LEDS) +
-    " pwmDuty: " + String(progVars.pwmDutyThou) +
     " Random string: '" + progVars.randomString +"'";
 }
 
