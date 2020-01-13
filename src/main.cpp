@@ -752,7 +752,7 @@ void loop() {
 
     if (do_led_update) {
       for (int i=0; i<NUM_LEDS; i++) {
-        updateLED(led_channels[i], programVars, 0);
+        updateLED(led_channels[i], programVars, i);
       }
 
       // print logging info if enabled
