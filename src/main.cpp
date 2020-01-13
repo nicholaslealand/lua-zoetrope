@@ -58,6 +58,8 @@ long prevFreqs[NUM_LEDS] = {0, 0, 0, 0};
 #define FREQ_MEASURE_TIMER            1
 #define FREQ_MEASURE_TIMER_PRESCALAR  80
 #define FREQ_MEASURE_TIMER_COUNT_UP   true
+// Joel: I can't verify that we actually need to divide by F_CPU here?
+// Documentation seems to imply that prescalar of 80 means ever timer increment is 1 microsecond
 #define FREQ_MEASURE_TIMER_PERIOD     FREQ_MEASURE_TIMER_PRESCALAR/F_CPU
 #define FREQ_MEASURE_SAMPLE_NUM       128
 // this returns a pointer to the hw_timer_t global variable
@@ -65,7 +67,6 @@ long prevFreqs[NUM_LEDS] = {0, 0, 0, 0};
 // 80 is prescaler so 80MHZ divided by 80 = 1MHZ signal ie 0.000001 of a second
 // true - counts up
 
-//Timers and counters and things
 /** Timer and process control **/
 uint32_t timestamp = 0;
 int timestampQuarter = 0;
@@ -84,13 +85,13 @@ void IRAM_ATTR onTimer(){
 }
 
 /** Timer for measuring freq **/
-volatile uint64_t StartValue;                     // First interrupt value
+volatile uint64_t last_timer_value = 0;
 bool fAdded = false;
 // Ring Buffer
-uint8_t ringIndex = 0;
-uint64_t myRing[FREQ_MEASURE_SAMPLE_NUM] = {0};
-
-float final_freq;
+uint8_t ring_buffer_idx = 0;
+// just putting a random start period/frequency in ringbuffer and final_freq - to avoid 0 which will result in no signal.
+uint64_t freq_ring_buffer[FREQ_MEASURE_SAMPLE_NUM] = { 100000 };
+float final_freq = 10.0;
 
 // pointer to a variable of type hw_timer_t 
 hw_timer_t * fTimer = NULL;
@@ -99,12 +100,6 @@ portMUX_TYPE fTimerMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Store the delta changes
 float freqDeltaLut[COOL_PERIOD_SECONDS];
-// Each LED follows the same pattern, but are offset by this number of seconds
-// e.g. LED3 is idx 2, 2 * 90 is 180. LED3 is 180 seconds ahead of LED1.
-#define LED_TIME_OFFSET 90
-// Multiply the timestamp by this number to the power of the LED idx
-// e.g. LED3 is idx 2, 1.1^2 is 1.21
-#define LED_TIME_MULTIPLIER 1.1
 
 // Digital Event Interrupt
 // Enters on falling edge in this example
@@ -113,14 +108,14 @@ void IRAM_ATTR handleFrequencyMeasureInterrupt()
 {
   portENTER_CRITICAL_ISR(&fTimerMux);
       // value of timer at interrupt
-      uint64_t TempVal= timerRead(fTimer);
-      if (ringIndex == FREQ_MEASURE_SAMPLE_NUM -1 ) {
-        ringIndex = 0;
+      uint64_t timer_val = timerRead(fTimer);
+      if (ring_buffer_idx == FREQ_MEASURE_SAMPLE_NUM -1 ) {
+        ring_buffer_idx = 0;
       } else {
-        ringIndex++;
+        ring_buffer_idx++;
       }
-      myRing[ringIndex]= TempVal - StartValue;
-      StartValue = TempVal;
+      freq_ring_buffer[ring_buffer_idx]= timer_val - last_timer_value;
+      last_timer_value = timer_val;
       fAdded = true;
   portEXIT_CRITICAL_ISR(&fTimerMux);
 }
@@ -170,7 +165,7 @@ ProgramVars programVars = {
   true,    // runVariableDelta
   MOTOR_ZEO_GEARING_FACTOR, // freqConversionFactor
   {true, false, false, false},   // ledEnable
-  false,  // logging
+  true,   // logging
   false,  // stateChange
   ""      // randomString
 };
@@ -435,18 +430,36 @@ template<typename T> String arrayToString(T* array, uint32_t len) {
   return result;
 }
 
-String formatProgVars(long time, ProgramVars progVars) {
-  return String(time) + " ledEnable: " + arrayToString(progVars.ledEnable, NUM_LEDS) +
-    " setFreq: " + String(progVars.setFreq) +
-    " pwmFreq: " + arrayToString(progVars.pwmFreq, NUM_LEDS) +
-    " pwmDuty: " + String(progVars.pwmDutyThou) +
-    " freqDelta: " + arrayToString(progVars.freqDelta, NUM_LEDS) +
-    " Random string: '" + progVars.randomString +"'";
+String formatProgVars(long time, ProgramVars &progVars) {
+  String result = String(time) + " - ";
+  result += "freq=";
+  result += String(final_freq) + "(avg) ";
+  
+  if (progVars.useSetFreq) {
+    result += " useSetFreq=on," + String(progVars.setFreq) + " ";
+  } else {
+    result += " useSetFreq=off ";
+  }
+  
+  result += "pwmDuty: " + String(progVars.pwmDutyThou) + " ";
+  for (int i = 0; i < NUM_LEDS; i++) {
+    result += "LED" + String(i) + ":";
+    if (progVars.ledEnable[i]) {
+      result += "on {";
+      result += "pwmFreq=" + String(progVars.pwmFreq[i]) + " ";
+      result += "freqDelta=" + String(progVars.freqDelta[i]) + " ";
+      result += "pSpeed=" + String(progVars.patternSpeed[i]) + " ";
+      result += "pOffset=" + String(progVars.patternOffset[i]) + " ";
+      result += "} ";
+    } else {
+      result += "off ";
+    }
+  }
+  return result;
 }
 
-double calculateFinalFrequency(float avgPeriod, double conversionFactor) {
+inline double calc_final_frequency(float avgPeriod, double conversionFactor) {
   double frequencyAtMotor = 1 / (avgPeriod * FREQ_MEASURE_TIMER_PERIOD);
-  // Apply the conversion factor
   return frequencyAtMotor * conversionFactor;
 }
 
@@ -532,6 +545,8 @@ void setup() {
   // This replaces the giant switch/case statement and adds linear interpolation between values...
   KeyPoint keypoints[] = {
     KeyPoint { 0, 1.0 },
+    KeyPoint { 10, 1.5 },
+    KeyPoint { 20, 1.0 },
     KeyPoint { 101, 1.0 },
     KeyPoint { 102, 1.1 },
     KeyPoint { 111, 2.0 },
@@ -561,14 +576,17 @@ void setup() {
   buildLookupTable(keypoints, sizeof(keypoints)/sizeof(KeyPoint), freqDeltaLut, sizeof(freqDeltaLut)/sizeof(float));
 
   // Setup frequency measure timer
-  // sets pin high
-  pinMode(FREQ_MEASURE_PIN, INPUT);
-  // attaches pin to interrupt on Falling Edge
-  attachInterrupt(digitalPinToInterrupt(FREQ_MEASURE_PIN), handleFrequencyMeasureInterrupt, FALLING);
   // Setup the timer
   fTimer = timerBegin(FREQ_MEASURE_TIMER, FREQ_MEASURE_TIMER_PRESCALAR, FREQ_MEASURE_TIMER_COUNT_UP);
   // Start the timer
   timerStart(fTimer);
+  // initialise last timer value
+  last_timer_value = timerRead(fTimer);
+  // sets pin high
+  pinMode(FREQ_MEASURE_PIN, INPUT);
+  // attaches pin to interrupt on Falling Edge
+  attachInterrupt(digitalPinToInterrupt(FREQ_MEASURE_PIN), handleFrequencyMeasureInterrupt, FALLING);
+  
 }
 
 inline void roll_the_dice(ProgramVars& programVars, int percentChance) {
@@ -627,41 +645,32 @@ inline void roll_the_dice(ProgramVars& programVars, int percentChance) {
   }
 }
 
-inline void updateFreq(ProgramVars& programVars) {
-  if (programVars.useSetFreq) {
-    for (int i=0; i<NUM_LEDS; i++) {
-        programVars.pwmFreq[i] = programVars.setFreq;
-    }
-  } else {
-    for (int i=0; i<NUM_LEDS; i++) {
-      programVars.pwmFreq[i] = final_freq * programVars.freqDelta[i];
-    }
-  }
-}
-
 inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars, uint8_t led) {
-  if (programVars.runVariableDelta == true) {
-    // we need to base timestamp of off when the parameters were last set, otherwise leds with two different patternSpeed values
-    // will diverge further and further the longer the code runs, even if they specify a small offset.
-    uint32_t ts = timestamp - timestamp_of_last_change;
-    // modifies the delta/modifier based on the timestamp in seconds on a cycle (hence the modulo)
-    uint32_t relativeTime = ((uint32_t)(programVars.patternSpeed[led] * ts) + programVars.patternOffset[led]) % COOL_PERIOD_SECONDS;
-
-    programVars.freqDelta[led] = freqDeltaLut[relativeTime];
-  }
-  updateFreq(programVars);
-
   if (programVars.ledEnable[led] == true) {
+    if (programVars.useSetFreq) {
+      programVars.pwmFreq[led] = programVars.setFreq;
+    } else {
+      if (programVars.runVariableDelta == true) {
+        // we need to base timestamp of off when the parameters were last set, otherwise leds with two different patternSpeed values
+        // will diverge further and further the longer the code runs, even if they specify a small offset.
+        uint32_t ts = timestamp - timestamp_of_last_change;
+        // modifies the delta/modifier based on the timestamp in seconds on a cycle (hence the modulo)
+        uint32_t relativeTime = ((uint32_t)(programVars.patternSpeed[led] * ts) + programVars.patternOffset[led]) % COOL_PERIOD_SECONDS;
+
+        programVars.freqDelta[led] = freqDeltaLut[relativeTime];
+      }
+      programVars.pwmFreq[led] = final_freq * programVars.freqDelta[led];
+    }
     ledcWrite(pwm_channel, programVars.pwmDutyThou);
+    
+    if ( programVars.pwmFreq[led] != prevFreqs[led]) {
+      ledcWriteTone(pwm_channel, programVars.pwmFreq[led]);
+      prevFreqs[led] = programVars.pwmFreq[led];  
+    }
   } else {
     ledcWrite(pwm_channel, 0);
   }
   
-  // Change the PWM freq if it has changed
-  if ( programVars.pwmFreq[led] != prevFreqs[led]) {
-    ledcWriteTone(pwm_channel, programVars.pwmFreq[led]);
-    prevFreqs[led] = programVars.pwmFreq[led];  
-  }
 }
  
 void loop() {
@@ -681,21 +690,25 @@ void loop() {
     }
 
     bool do_led_update = false;
+
     if (programVars.stateChange == true || fAdded == true) {
       if (fAdded) {
         // calculate the frequency from the average period
-        uint64_t sumPeriod = 0;
+        uint64_t sum_period = 0;
         for (int i = 0; i < FREQ_MEASURE_SAMPLE_NUM; ++i)
         {
-          sumPeriod += myRing[i];
+          sum_period += freq_ring_buffer[i];
         }
         // TODO: This is will calculate an incorrect sum until we have 128 samples
-        float avgPeriod = ((float)sumPeriod)/FREQ_MEASURE_SAMPLE_NUM;
-        final_freq = calculateFinalFrequency(avgPeriod, programVars.freqConversionFactor);
+        float avg_period = ((float)sum_period) / FREQ_MEASURE_SAMPLE_NUM;
+
+        double freq_at_motor = 1 / (avg_period * FREQ_MEASURE_TIMER_PERIOD);
+        final_freq = freq_at_motor * programVars.freqConversionFactor;
       }
       // make sure to update leds so that they reflect the new frequency measure
       do_led_update = true;
 
+      // clear triggers
       fAdded = false;
       programVars.stateChange = false;
     }
@@ -706,7 +719,7 @@ void loop() {
       timestamp++;
       timestampQuarter = 0;
 
-      // optionally run each led briefly at startup
+      // STARTUP TEST - optionally run each led briefly at startup
       uint32_t total_test_period = LED_TEST_PERIOD * NUM_LEDS;
       if (do_test && test_progress < total_test_period) {
         uint8_t current_led = test_progress / NUM_LEDS;
