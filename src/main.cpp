@@ -145,7 +145,7 @@ uint32_t test_progress = 0;
 #define LED_TEST_PERIOD 5
 // Set to true to disable randomised changes to led parameters/patterns
 bool do_randomisation = true;
-uint32_t randomisation_cooldown = 0;
+uint32_t timestamp_of_last_change = 0;
 #define RANDOM_COOLDOWN_PERIOD 60
 
 // A 'struct' is an object containing other variables
@@ -580,10 +580,12 @@ void setup() {
 }
 
 inline void roll_the_dice(ProgramVars& programVars, int percentChance) {
-  if (randomisation_cooldown > 0) {
-    randomisation_cooldown -= 1;
+  if (timestamp_of_last_change != 0 // if last_change is 0 we haven't rolled the dice yet
+    && timestamp - timestamp_of_last_change < RANDOM_COOLDOWN_PERIOD) {
+    // no change if we've already made a change in the last RANDOM_COOLDOWN_PERIOD seconds
+    return;
   } else if (random(100) < percentChance) {
-    // ^ after cooldown, chance of change is 10%
+    // ^ after cooldown, chance of change is percentChance in % (0 - 100)
 
     for (int i=0; i<NUM_LEDS; i++) {
       programVars.ledEnable[i] = false;
@@ -607,10 +609,13 @@ inline void roll_the_dice(ProgramVars& programVars, int percentChance) {
 
       first_led = (single_or_dual_led - dual_threshold) / first_led_split;
       second_led = ((single_or_dual_led - dual_threshold) % first_led_split) / second_led_split;
-      
-      programVars.ledEnable[first_led] = true;
-      programVars.ledEnable[second_led] = true;
+      if (second_led >= first_led) second_led += 1;
     }
+    
+    // Due to rounding of splits to integer, the selected led indexes could be >= NUM_LEDS
+    first_led = first_led % NUM_LEDS;
+    second_led = first_led % NUM_LEDS;
+
     if (first_led < NUM_LEDS) {
       programVars.ledEnable[first_led] = true;
       // 0.9 - 1.1
@@ -619,20 +624,24 @@ inline void roll_the_dice(ProgramVars& programVars, int percentChance) {
     }
     if (second_led < NUM_LEDS) {
       programVars.ledEnable[second_led] = true;
-      // 1.1 - 1.4
-      programVars.patternSpeed[second_led] = 1.1f + (((float) random(0, 30)) * 0.01);
-      programVars.patternOffset[second_led] = random(0, COOL_PERIOD_SECONDS);
+      // These are based off of values taken for first_led.
+      // speed +/- 0.05, offset +/- 5 seconds
+      programVars.patternSpeed[second_led] = programVars.patternSpeed[first_led] - 0.05 + (((float) random(0, 10)) * 0.01);
+      programVars.patternOffset[second_led] = (programVars.patternOffset[first_led] - 5 + random(0, 10)) % COOL_PERIOD_SECONDS;
       
     }
 
-    randomisation_cooldown = RANDOM_COOLDOWN_PERIOD;
+    timestamp_of_last_change = timestamp;
   }
 }
 
 inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars, uint8_t led) {
   if (programVars.runVariableDelta == true) {
+    // we need to base timestamp of off when the parameters were last set, otherwise leds with two different patternSpeed values
+    // will diverge further and further the longer the code runs, even if they specify a small offset.
+    uint32_t ts = timestamp - timestamp_of_last_change;
     // modifies the delta/modifier based on the timestamp in seconds on a cycle (hence the modulo)
-    uint32_t relativeTime = ((uint32_t)(programVars.patternSpeed[led] * timestamp) + programVars.patternOffset[led]) % COOL_PERIOD_SECONDS;
+    uint32_t relativeTime = ((uint32_t)(programVars.patternSpeed[led] * ts) + programVars.patternOffset[led]) % COOL_PERIOD_SECONDS;
     programVars.freqDelta[led] = freqDeltaLut[relativeTime];
   }
 
