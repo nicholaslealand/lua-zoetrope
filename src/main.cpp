@@ -632,11 +632,14 @@ inline void roll_the_dice(ProgramVars& programVars, int percentChance) {
       first_led = (single_or_dual_led - dual_threshold) / first_led_split;
       second_led = ((single_or_dual_led - dual_threshold) % first_led_split) / second_led_split;
       if (second_led >= first_led) second_led += 1;
+
+      //Serial.println("second led info- firstsplit " + String(first_led_split) + " secondsplit " + String(second_led_split)
+      //+ " 1st " + String(first_led) + " 2nd " + String(second_led));
     }
     
     // Due to rounding of splits to integer, the selected led indexes could be >= NUM_LEDS
     first_led = first_led % NUM_LEDS;
-    second_led = first_led % NUM_LEDS;
+    second_led = second_led % NUM_LEDS;
 
     if (first_led < NUM_LEDS) {
       programVars.ledEnable[first_led] = true;
