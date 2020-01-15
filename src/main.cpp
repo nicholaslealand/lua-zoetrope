@@ -673,12 +673,15 @@ inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars, uint8_t le
       }
       programVars.pwmFreq[led] = final_freq * programVars.freqDelta[led];
     }
-    ledcWrite(pwm_channel, programVars.pwmDutyThou);
     
     if ( programVars.pwmFreq[led] != prevFreqs[led]) {
       ledcWriteTone(pwm_channel, programVars.pwmFreq[led]);
       prevFreqs[led] = programVars.pwmFreq[led];  
     }
+    // Not sure how ledcWriteTone and ledcWrite interact
+    // There is very little documentation. ledcWriteTone calls ledcWrite internally...
+    // so I'm not even sure if this call is required.
+    ledcWrite(pwm_channel, programVars.pwmDutyThou);
   } else {
     ledcWrite(pwm_channel, 0);
   }
