@@ -21,6 +21,7 @@
  **/
 #include "BluetoothSerial.h"
 
+// Length of frequency changes 
 #define COOL_PERIOD_SECONDS           400
 
 // Argument type defines
@@ -29,38 +30,48 @@
 #define ARGUMENT_TYPE_DOUBLE          2
 #define ARGUMENT_TYPE_STRING          3
 
-// Defines
 // Motor to Zeo rotation conversion factor
 #define MOTOR_ZEO_GEARING_FACTOR      4.19
 // to move to slower sensor I have multiplied this factor by 14.099
 // average motor sensor is 17.019 ms avare head sensor is 239.95ms
 // #define MOTOR_ZEO_GEARING_FACTOR      0.29 this is pretty good for the orange belt
 // #define MOTOR_ZEO_GEARING_FACTOR      0.275 this is using the elastic band
+
 // The 'pin' the LED is on - In the case of NodeMCU pin2 is the onboard led
 #define LED_ONBOARD_PIN               2
-#define LED_PIN                       12
-// DEVKIT V1 uses pin 23
-// #define LED_PIN               23
-// The PWM channel for the LED 0 to 15
-#define LED_PWM_CHANNEL               0
+
 // PWM resolution in bits
 #define LED_PWM_RESOLUTION            8
 // PWM inital duty
-#define LED_PWM_INITAL_DUTY           5
+#define LED_PWM_INITIAL_DUTY          5
+// PWM LED off - you'd think 0 would be off, but depending on how it's wired
+// you may need to use 256, see discussion here:
+// https://github.com/espressif/arduino-esp32/issues/689
+#define LED_OFF                       256
+//#define LED_OFF                       0
+
+// We set up for three LEDs to be controlled...
+// DEVKIT V1 uses pin 23
+#define NUM_LEDS 4
+uint16_t led_pins[NUM_LEDS] = {13, 14, 15, 16};
+uint8_t led_channels[NUM_LEDS] = {0, 1, 2, 3};
+// prev freq for freq compare, 
+long prevFreqs[NUM_LEDS] = {0, 0, 0, 0};
 
 // Frequency measure
 #define FREQ_MEASURE_PIN              19
 #define FREQ_MEASURE_TIMER            1
 #define FREQ_MEASURE_TIMER_PRESCALAR  80
 #define FREQ_MEASURE_TIMER_COUNT_UP   true
+// Joel: I can't verify that we actually need to divide by F_CPU here?
+// Documentation seems to imply that prescalar of 80 means ever timer increment is 1 microsecond
 #define FREQ_MEASURE_TIMER_PERIOD     FREQ_MEASURE_TIMER_PRESCALAR/F_CPU
-#define FREQ_MEASUER_SAMPLE_NUM       128
+#define FREQ_MEASURE_SAMPLE_NUM       128
 // this returns a pointer to the hw_timer_t global variable
 // 0 = first timer
 // 80 is prescaler so 80MHZ divided by 80 = 1MHZ signal ie 0.000001 of a second
 // true - counts up
 
-//Timers and counters and things
 /** Timer and process control **/
 uint32_t timestamp = 0;
 int timestampQuarter = 0;
@@ -79,20 +90,21 @@ void IRAM_ATTR onTimer(){
 }
 
 /** Timer for measuring freq **/
-volatile uint64_t StartValue;                     // First interrupt value
+volatile uint64_t last_timer_value = 0;
 bool fAdded = false;
-// Our own Ring Buffer
-uint8_t ringIndex = 0;
-uint64_t myRing[FREQ_MEASUER_SAMPLE_NUM] = {0};
-// average freq intermediate values as globals. Bite me!
-uint64_t sumPeriod;
-float avgPeriod;
-// prev freq for freq compare
-long prevFreq = 0;
+// Ring Buffer
+uint8_t ring_buffer_idx = 0;
+// just putting a random start period/frequency in ringbuffer and final_freq - to avoid 0 which will result in no signal.
+uint64_t freq_ring_buffer[FREQ_MEASURE_SAMPLE_NUM] = { 100000 };
+float final_freq = 10.0;
 
-hw_timer_t * fTimer = NULL;                       // pointer to a variable of type hw_timer_t 
-portMUX_TYPE fTimerMux = portMUX_INITIALIZER_UNLOCKED;  // synchs between maon cose and interrupt?
+// pointer to a variable of type hw_timer_t 
+hw_timer_t * fTimer = NULL;
+// syncs between main and interrupt
+portMUX_TYPE fTimerMux = portMUX_INITIALIZER_UNLOCKED;
 
+// Store the delta changes
+float freqDeltaLut[COOL_PERIOD_SECONDS];
 
 // Digital Event Interrupt
 // Enters on falling edge in this example
@@ -100,21 +112,15 @@ portMUX_TYPE fTimerMux = portMUX_INITIALIZER_UNLOCKED;  // synchs between maon c
 void IRAM_ATTR handleFrequencyMeasureInterrupt()
 {
   portENTER_CRITICAL_ISR(&fTimerMux);
-      // uint8_t blah = 8;
       // value of timer at interrupt
-      uint64_t TempVal= timerRead(fTimer);
-      if (ringIndex == FREQ_MEASUER_SAMPLE_NUM -1 ) {
-        ringIndex = 0;
+      uint64_t timer_val = timerRead(fTimer);
+      if (ring_buffer_idx == FREQ_MEASURE_SAMPLE_NUM -1 ) {
+        ring_buffer_idx = 0;
       } else {
-        ringIndex++;
+        ring_buffer_idx++;
       }
-      // // Add period to RunningAverage, period is in number of FREQ_MEASURE_TIMER_PERIOD
-      // // Note: Is timer overflow safe
-      // This one MOFO's
-      myRing[ringIndex]= TempVal - StartValue;
-      // frequencyRA.addValue(TempVal - StartValue);
-      // // puts latest reading as start for next calculation
-      StartValue = TempVal;
+      freq_ring_buffer[ring_buffer_idx]= timer_val - last_timer_value;
+      last_timer_value = timer_val;
       fAdded = true;
   portEXIT_CRITICAL_ISR(&fTimerMux);
 }
@@ -126,34 +132,47 @@ BluetoothSerial SerialBT;
 String serialBuffer = "";
 String messages;
 
+// This will run each LED for 5 seconds, before letting things proceed normally
+bool do_test = true;
+uint32_t test_progress = 0;
+#define LED_TEST_PERIOD 5
+// Set to true to disable randomised changes to led parameters/patterns
+bool do_randomisation = true;
+uint32_t timestamp_of_last_change = 0;
+#define RANDOM_COOLDOWN_PERIOD 60
+
 // A 'struct' is an object containing other variables
 // This defines the struct data type
 struct ProgramVars {
-  long    pwmFreq;
+  long    pwmFreq[NUM_LEDS];
   long    setFreq;
   bool    useSetFreq;
   long    pwmDutyThou;
-  double  freqDelta;
+  double  freqDelta[NUM_LEDS];
+  int     patternOffset[NUM_LEDS];
+  float   patternSpeed[NUM_LEDS];
   bool    runVariableDelta;
   double  freqConversionFactor;
-  bool    ledEnable;
+  bool    ledEnable[NUM_LEDS];
   bool    logging;
   bool    stateChange;
   String  randomString;
 };
 // This creates a new variable which is of the above struct type
 ProgramVars programVars = {
-  0,      // pwmFreq
+  {0, 0, 0, 0},      // pwmFreq
   0,      // setFreq
   false,  // useSetFreq
-  LED_PWM_INITAL_DUTY,      // pwmDutyThou
-  1.0,    // freqDelta
+  LED_PWM_INITIAL_DUTY,      // pwmDutyThou
+  {1.0, 1.0, 1.0, 1.0},    // freqDelta
+  {0, 50, 100, 150}, // patternOffset
+  {1.0f, 1.0f, 1.0f, 1.0f}, // patternSpeed
   true,    // runVariableDelta
   MOTOR_ZEO_GEARING_FACTOR, // freqConversionFactor
-  true,   // ledEnable
-  false,  //  logging
+  {true, false, false, false},   // ledEnable
+  true,   // logging
   false,  // stateChange
-  ""      //randomString
+  ""      // randomString
 };
 
 
@@ -163,7 +182,7 @@ ProgramVars programVars = {
  * In C/C++ rather than return the parts, we act on pointers to the variables
  * Pointers to variables (the memory location of a variable) are denoted by a '*'
  * 
- * This function returns EXIT_FAILURE (cuold be 0) if it fails,
+ * This function returns EXIT_FAILURE (could be 0) if it fails,
  * or EXIT_SUCCESS (could be 1) if everything is OK
  **/
  int getCommandAndArgument(String inputString, char *command, String *argument) {
@@ -377,7 +396,9 @@ ProgramVars programVars = {
       progVars->stateChange = argDisplayOrSetLong("pwmDuty", comArgState, &progVars->pwmDutyThou, message);
       break;
     case 'm':
-      progVars->stateChange = argDisplayOrSetDoubleFromLong("freqDelta", comArgState, &progVars->freqDelta, 100, message);
+      for (int i=0; i < NUM_LEDS; i++) {
+        progVars->stateChange |= argDisplayOrSetDoubleFromLong("freqDelta", comArgState, &progVars->freqDelta[i], 100, message);
+      }
       break;
     case 'v':
       progVars->stateChange = argDisplayOrSetBoolean("runVariableDelta", comArgState, &progVars->runVariableDelta, message);
@@ -389,7 +410,9 @@ ProgramVars programVars = {
       progVars->stateChange = argDisplayOrSetString("randomString", comArgState, &progVars->randomString, message);
       break;
     case 'l':
-      progVars->stateChange = argDisplayOrSetBoolean("ledEnable", comArgState, &progVars->ledEnable, message);
+      for (int i=0; i < NUM_LEDS; i++) {
+        progVars->stateChange |= argDisplayOrSetBoolean("ledEnable", comArgState, &progVars->ledEnable[i], message);
+      }
       break;
     case 'L':
       progVars->stateChange = argDisplayOrSetBoolean("logging", comArgState, &progVars->logging, message);
@@ -402,399 +425,95 @@ ProgramVars programVars = {
     return EXIT_SUCCESS;
   }
 
-String formatProgVars(long time, ProgramVars progVars) {
-  return String(time) + " ledEnable: " + String(progVars.ledEnable) +
-    " setFreq: " + String(progVars.setFreq) +
-    " pwmFreq: " + String(progVars.pwmFreq) +
-    " pwmDuty: " + String(progVars.pwmDutyThou) +
-    " freqDelta: " + String(progVars.freqDelta) +
-    " pwmDuty: " + String(progVars.pwmDutyThou) +
-    " Random string: '" + progVars.randomString +"'";
+
+template<typename T> String arrayToString(T* array, uint32_t len) {
+  String result = "[";
+  for (uint32_t i=0; i < len - 1; i++) {
+    result += String(array[i]) + ", ";
+  }
+  result += array[len - 1] + "]";
+  return result;
 }
 
-double calculateFinalFrequency(float avgPeriod, double conversionFactor) {
+String formatProgVars(long time, ProgramVars &progVars) {
+  String result = String(time) + " - ";
+  result += "freq=";
+  result += String(final_freq) + "(avg) ";
+  
+  if (progVars.useSetFreq) {
+    result += " useSetFreq=on," + String(progVars.setFreq) + " ";
+  } else {
+    result += " useSetFreq=off ";
+  }
+  if (progVars.runVariableDelta) {
+    result += " varDelta=on ";
+  } else {
+    result += " varDelta=off ";
+  }
+  
+  result += "pwmDuty: " + String(progVars.pwmDutyThou) + " ";
+  for (int i = 0; i < NUM_LEDS; i++) {
+    result += "LED" + String(i) + ":";
+    if (progVars.ledEnable[i]) {
+      result += "on {";
+      result += "pwmFreq=" + String(progVars.pwmFreq[i]) + " ";
+      result += "freqDelta=" + String(progVars.freqDelta[i]) + " ";
+      result += "pSpeed=" + String(progVars.patternSpeed[i]) + " ";
+      result += "pOffset=" + String(progVars.patternOffset[i]) + " ";
+      result += "} ";
+    } else {
+      result += "off ";
+    }
+  }
+  return result;
+}
+
+inline double calc_final_frequency(float avgPeriod, double conversionFactor) {
   double frequencyAtMotor = 1 / (avgPeriod * FREQ_MEASURE_TIMER_PERIOD);
-  // Apply the conversion factor
   return frequencyAtMotor * conversionFactor;
 }
 
-/** This function modifies the delta/modifier based on the timestamp in seconds
- * on a cycle (hence the modulo)
- **/
-void makeShitCoolAgain(uint32_t timestamp, ProgramVars *programVars) {
-  uint32_t relativeTime = timestamp % COOL_PERIOD_SECONDS;
+struct KeyPoint {
+  uint16_t t;
+  float freqDelta;
+};
 
-  switch(relativeTime) {
-    case 0:
-      programVars->freqDelta = 1.0;
-      break;
-    case 1:
-      programVars->freqDelta = 1.0;
-      break;
-    case 102:
-      programVars->freqDelta = 1.1;
-      break;
-    case 103:
-      programVars->freqDelta = 1.2;
-      break;
-    case 104:
-      programVars->freqDelta = 1.3;
-      break;
-    case 105:
-      programVars->freqDelta = 1.4;
-      break;
-    case 106:
-      programVars->freqDelta = 1.5;
-      break;
-    case 107:
-      programVars->freqDelta = 1.6;
-      break;
-    case 108:
-      programVars->freqDelta = 1.7;
-      break;
-    case 109:
-      programVars->freqDelta = 1.8;
-      break;
-    case 110:
-      programVars->freqDelta = 1.9;
-      break;
-    case 111:
-      programVars->freqDelta = 2.0;
-      break;
-    case 112:
-      programVars->freqDelta = 2.0;
-      break;
-    case 113:
-      programVars->freqDelta = 2.0;
-      break;
-    case 114:
-      programVars->freqDelta = 2.0;
-      break;
-    case 115:
-      programVars->freqDelta = 2.0;
-      break;
-    case 116:
-      programVars->freqDelta = 2.0;
-      break;
-    case 117:
-      programVars->freqDelta = 2.0;
-      break;
-    case 118:
-      programVars->freqDelta = 2.0;
-      break;
-    case 119:
-      programVars->freqDelta = 2.0;
-      break;
-    case 120:
-      programVars->freqDelta = 2.0;
-      break;
-    case 121:
-      programVars->freqDelta = 2.0;
-      break;
-    case 122:
-      programVars->freqDelta = 2.0;
-      break;
-    case 123:
-      programVars->freqDelta = 2.0;
-      break;
-    case 124:
-      programVars->freqDelta = 2.0;
-      break;
-    case 125:
-      programVars->freqDelta = 2.0;
-      break;
-    case 126:
-      programVars->freqDelta = 2.0;
-      break;
-    case 127:
-      programVars->freqDelta = 2.0;
-      break;
-    case 128:
-      programVars->freqDelta = 2.0;
-      break;
-    case 129:
-      programVars->freqDelta = 2.0;
-      break;
-    case 130:
-      programVars->freqDelta = 2.1;
-      break;
-    case 131:
-      programVars->freqDelta = 2.2;
-      break;
-    case 132:
-      programVars->freqDelta = 2.3;
-      break;
-    case 133:
-      programVars->freqDelta = 2.4;
-      break;
-    case 134:
-      programVars->freqDelta = 2.5;
-      break;
-    case 135:
-      programVars->freqDelta = 2.6;
-      break;
-    case 136:
-      programVars->freqDelta = 2.7;
-      break;
-    case 137:
-      programVars->freqDelta = 2.8;
-      break;
-    case 138:
-      programVars->freqDelta = 2.9;
-      break;
-    case 139:
-      programVars->freqDelta = 3.0;
-      break;
-    case 140:
-      programVars->freqDelta = 3.0;
-      break;
-    case 141:
-      programVars->freqDelta = 3.0;
-      break;
-    case 142:
-      programVars->freqDelta = 3.0;
-      break;
-    case 143:
-      programVars->freqDelta = 3.0;
-      break;
-    case 144:
-      programVars->freqDelta = 3.0;
-      break;
-    case 145:
-      programVars->freqDelta = 3.0;
-      break;
-    case 146:
-      programVars->freqDelta = 3.0;
-      break;
-    case 147:
-      programVars->freqDelta = 3.0;
-      break;
-    case 148:
-      programVars->freqDelta = 3.0;
-      break;
-    case 149:
-      programVars->freqDelta = 3.0;
-      break;
-    case 150:
-      programVars->freqDelta = 3.0;
-      break;
-    case 151:
-      programVars->freqDelta = 3.1;
-      break;
-    case 152:
-      programVars->freqDelta = 3.2;
-      break;
-    case 153:
-      programVars->freqDelta = 3.3;
-      break;
-    case 154:
-      programVars->freqDelta = 3.3;
-      break;
-    case 155:
-      programVars->freqDelta = 3.4;
-      break;
-    case 156:
-      programVars->freqDelta = 3.5;
-      break;
-    case 157:
-      programVars->freqDelta = 3.6;
-      break;
-    case 158:
-      programVars->freqDelta = 3.7;
-      break;
-    case 159:
-      programVars->freqDelta = 3.8;
-      break;
-    case 160:
-      programVars->freqDelta = 3.9;
-      break;
-    case 161:
-      programVars->freqDelta = 4.0;
-      break;
-    case 162:
-      programVars->freqDelta = 4.0;
-      break;
-    case 163:
-      programVars->freqDelta = 4.0;
-      break;
-    case 164:
-      programVars->freqDelta = 4.0;
-      break;
-    case 165:
-      programVars->freqDelta = 4.0;
-      break;
-    case 166:
-      programVars->freqDelta = 4.0;
-      break;
-    case 167:
-      programVars->freqDelta = 4.0;
-      break;
-    case 168:
-      programVars->freqDelta = 4.0;
-      break;
-    case 169:
-      programVars->freqDelta = 4.0;
-      break;
-    case 170:
-      programVars->freqDelta = 4.0;
-      break;
-    case 171:
-      programVars->freqDelta = 4.0;
-      break;
-    case 172:
-      programVars->freqDelta = 4.0;
-      break;
-    case 173:
-      programVars->freqDelta = 4.0;
-      break;
-    case 174:
-      programVars->freqDelta = 4.0;
-      break;
-    case 175:
-      programVars->freqDelta = 4.0;
-      break;
-    case 176:
-      programVars->freqDelta = 4.0;
-      break;
-    case 177:
-      programVars->freqDelta = 4.0;
-      break;
-    case 178:
-      programVars->freqDelta = 4.0;
-      break;
-    case 179:
-      programVars->freqDelta = 4.0;
-      break;
-    case 180:
-      programVars->freqDelta = 4.0;
-      break;
-    case 181:
-      programVars->freqDelta = 3.9;
-      break;
-    case 182:
-      programVars->freqDelta = 3.8;
-      break;
-    case 183:
-      programVars->freqDelta = 3.5;
-      break;
-    case 184:
-      programVars->freqDelta = 3.2;
-      break;
-    case 185:
-      programVars->freqDelta = 3.0;
-      break;
-    case 186:
-      programVars->freqDelta = 2.9;
-      break;
-    case 187:
-      programVars->freqDelta = 2.7;
-      break;
-    case 188:
-      programVars->freqDelta = 2.4;
-      break;
-    case 189:
-      programVars->freqDelta = 2.3;
-      break;
-    case 190:
-      programVars->freqDelta = 2.2;
-      break;
-    case 191:
-      programVars->freqDelta = 2.1;
-      break;
-    case 192:
-      programVars->freqDelta = 1.9;
-      break;
-    case 193:
-      programVars->freqDelta = 1.8;
-      break;
-    case 194:
-      programVars->freqDelta = 1.7;
-      break;
-    case 195:
-      programVars->freqDelta = 1.6;
-      break;
-    case 196:
-      programVars->freqDelta = 1.5;
-      break;
-    case 197:
-      programVars->freqDelta = 1.4;
-      break;
-    case 198:
-      programVars->freqDelta = 1.3;
-      break;
-    case 199:
-      programVars->freqDelta = 1.2;
-      break;
-    case 200:
-      programVars->freqDelta = 1.1;
-      break;
-    case 210:
-      programVars->freqDelta = 1.0;
-      break;
-    case 215:
-      programVars->freqDelta = 1.95;
-      break;
-    case 220:
-      programVars->freqDelta = 1.9;
-      break;
-    case 230:
-      programVars->freqDelta = 1.8;
-      break;
-    case 235:
-      programVars->freqDelta = 1.7;
-      break;
-    case 240:
-      programVars->freqDelta = 1.6;
-      break;
-    case 245:
-      programVars->freqDelta = 1.5;
-      break;
-    case 250:
-      programVars->freqDelta = 1.4;
-      break;
-    case 260:
-      programVars->freqDelta = 1.3;
-      break;
-    case 270:
-      programVars->freqDelta = 1.2;
-      break;
-    case 280:
-      programVars->freqDelta = 1.1;
-      break;
-    case 290:
-      programVars->freqDelta = 1.05;
-      break;
-    case 300:
-      programVars->freqDelta = 1.01;
-      break;
-    case 330:
-      programVars->freqDelta = 1;
-      break;
-    case 340:
-      programVars->freqDelta = 5;
-      break;
-      case 350:
-      programVars->freqDelta = 1;
-      break;
-      case 360:
-      programVars->freqDelta = 5;
-      break;
-      case 370:
-      programVars->freqDelta = 1;
-      break;
+void buildLookupTable(KeyPoint *keypoints, uint16_t num_keypoints, float* lookup_table, uint16_t lookup_table_size) {
+  float default_freqDelta = 1.0;
+  // Without any keypoints, just set all entries zero
+  if (num_keypoints == 0) {
+    for (int i=0; i < lookup_table_size; i++) {
+      lookup_table[i] = default_freqDelta;
+    }
+  }
+  KeyPoint last_point;
+  int start_idx;
+  if (keypoints[0].t != 0) {
+    last_point = KeyPoint { 0, default_freqDelta };
+    start_idx = 0;
+  } else {
+    last_point = keypoints[0];
+    start_idx = 1;
+  }
+  
+  int lut_idx = 0;
+  for (int i=start_idx; i < num_keypoints; i++) {
+    // Just using linear interpolation for now
+    // TODO maybe smooth keypoints with splines if you want to get fancy...
+    float step_size = (keypoints[i].freqDelta - last_point.freqDelta) / (keypoints[i].t - last_point.t);
+    while (lut_idx <= keypoints[i].t && lut_idx < lookup_table_size) {
+      lookup_table[lut_idx] = last_point.freqDelta + ((lut_idx - last_point.t) * step_size);
+      lut_idx++;
+    } 
+    last_point = keypoints[i];
+  }
+  while (lut_idx < lookup_table_size - 1) {
+    lookup_table[lut_idx + 1] = lookup_table[lut_idx];
+    lut_idx++;
   }
 }
 
-
 void setup() {
-  // Initialise the serial hardware at baude 115200
-  Serial.begin(115200);
- 
-  // Initialise the Bluetooth hardware with a name 'ESP32'
-  if(!SerialBT.begin("ESP32")){
-    Serial.println("An error occurred initializing Bluetooth");
-  }
-
   // Give a semaphore that we can check in the loop
   // Setup Timer 1 on interrupt
   // Create semaphore to inform us when the timer has fired
@@ -811,29 +530,173 @@ void setup() {
   // Start an alarm
   timerAlarmEnable(timer);
 
+  // Setup PWM channels
+  double startFreq = 500.0;
+  for (int i=0; i<NUM_LEDS; i++) {
+    // configure LED PWM functionalitites
+    ledcSetup(led_channels[i], startFreq, LED_PWM_RESOLUTION);
+  
+    // Attach the channel to the GPIO to be controlled
+    ledcAttachPin(led_pins[i], led_channels[i]);
+  
+    // Set initial duty now, to avoid things being too bright at startup...
+    ledcWrite(led_channels[i], programVars.pwmDutyThou);
+  }
+  // Make onboard LED mimic LED1
+  ledcAttachPin(LED_ONBOARD_PIN, led_pins[0]);
 
-  // Attach an LED thingee
-  // configure LED PWM functionalitites
-  // ledcSetup(LED_PWM_CHANNEL, programVars.pwmFreq, LED_PWM_RESOLUTION);
-  ledcSetup(LED_PWM_CHANNEL, 500, LED_PWM_RESOLUTION);
-  // attach the channel to the GPIO to be controlled
-  ledcAttachPin(LED_ONBOARD_PIN, LED_PWM_CHANNEL);
-  ledcAttachPin(LED_PIN, LED_PWM_CHANNEL);
+  // Initialise the serial hardware at baude 115200
+  Serial.begin(115200);
+ 
+  // Initialise the Bluetooth hardware with a name 'ESP32'
+  if(!SerialBT.begin("ESP32")){
+    Serial.println("An error occurred initializing Bluetooth");
+  }
 
+  // Build lookup tables for freq modulation
+  // This replaces the giant switch/case statement and adds linear interpolation between values...
+  KeyPoint keypoints[] = {
+    KeyPoint { 0, 1.0 },
+    KeyPoint { 10, 1.5 },
+    KeyPoint { 20, 1.0 },
+    KeyPoint { 50, 1.3 },
+    KeyPoint { 101, 1.0 },
+    KeyPoint { 102, 1.1 },
+    KeyPoint { 111, 2.0 },
+    KeyPoint { 129, 2.0 },
+    KeyPoint { 139, 3.0 },
+    KeyPoint { 150, 3.0 },
+    KeyPoint { 161, 4.0 },
+    KeyPoint { 180, 4.0 },
+    KeyPoint { 200, 1.1 },
+    KeyPoint { 210, 1.0 },
+    KeyPoint { 200, 1.1 },
+    KeyPoint { 214, 1.1 },
+    KeyPoint { 215, 1.95 },
+    KeyPoint { 220, 1.9 },
+    KeyPoint { 230, 1.8 },
+    KeyPoint { 250, 1.4 },
+    KeyPoint { 260, 1.3 },
+    KeyPoint { 280, 1.1 },
+    KeyPoint { 290, 1.05 },
+    KeyPoint { 300, 1.01 },
+    KeyPoint { 330, 1 },
+    KeyPoint { 340, 5 },
+    KeyPoint { 350, 1 },
+    KeyPoint { 360, 5 },
+    KeyPoint { 370, 1 },
+  };
+  buildLookupTable(keypoints, sizeof(keypoints)/sizeof(KeyPoint), freqDeltaLut, sizeof(freqDeltaLut)/sizeof(float));
+  // For debugging lut construction, might use it to check when trying spline interpolation...
+  //for (int i=0; i<100; i++) {
+  //  Serial.println(String(i) + " " + String(freqDeltaLut[i]));
+  //}
 
   // Setup frequency measure timer
-  // sets pin high
-  pinMode(FREQ_MEASURE_PIN, INPUT);
-  // attaches pin to interrupt on Falling Edge
-  attachInterrupt(digitalPinToInterrupt(FREQ_MEASURE_PIN), handleFrequencyMeasureInterrupt, FALLING);
   // Setup the timer
   fTimer = timerBegin(FREQ_MEASURE_TIMER, FREQ_MEASURE_TIMER_PRESCALAR, FREQ_MEASURE_TIMER_COUNT_UP);
   // Start the timer
   timerStart(fTimer);
+  // initialise last timer value
+  last_timer_value = timerRead(fTimer);
+  // sets pin high
+  pinMode(FREQ_MEASURE_PIN, INPUT);
+  // attaches pin to interrupt on Falling Edge
+  attachInterrupt(digitalPinToInterrupt(FREQ_MEASURE_PIN), handleFrequencyMeasureInterrupt, FALLING);
+  
+}
+
+inline void roll_the_dice(ProgramVars& programVars, int percentChance) {
+  if (timestamp_of_last_change != 0 // if last_change is 0 we haven't rolled the dice yet
+    && timestamp - timestamp_of_last_change < RANDOM_COOLDOWN_PERIOD) {
+    // no change if we've already made a change in the last RANDOM_COOLDOWN_PERIOD seconds
+    return;
+  } else if (random(100) < percentChance) {
+    // ^ after cooldown, chance of change is percentChance in % (0 - 100)
+
+    for (int i=0; i<NUM_LEDS; i++) {
+      programVars.ledEnable[i] = false;
+    }
+    // First select which combo of leds to have active
+    // We have a number of desired combos:
+    // - any single led, NUM_LED options
+    // - any two leds, NUM_LED*(NUM_LED-1) options
+    uint32_t single_or_dual_led = random(0, 1000);
+    // threshold for enabling two leds instead of one
+    uint32_t dual_threshold = 600;
+
+    uint8_t first_led = NUM_LEDS;
+    uint8_t second_led = NUM_LEDS;
+    if (single_or_dual_led < dual_threshold) {
+      uint16_t first_led_split = dual_threshold / NUM_LEDS;
+      first_led = single_or_dual_led / first_led_split;
+    } else {
+      uint16_t first_led_split = (1000 - dual_threshold) / NUM_LEDS;
+      uint16_t second_led_split = first_led_split / (NUM_LEDS - 1);
+
+      first_led = (single_or_dual_led - dual_threshold) / first_led_split;
+      second_led = ((single_or_dual_led - dual_threshold) % first_led_split) / second_led_split;
+      if (second_led >= first_led) second_led += 1;
+
+      //Serial.println("second led info- firstsplit " + String(first_led_split) + " secondsplit " + String(second_led_split)
+      //+ " 1st " + String(first_led) + " 2nd " + String(second_led));
+    }
+    
+    // Due to rounding of splits to integer, the selected led indexes could be >= NUM_LEDS
+    first_led = first_led % NUM_LEDS;
+    second_led = second_led % NUM_LEDS;
+
+    if (first_led < NUM_LEDS) {
+      programVars.ledEnable[first_led] = true;
+      // 0.9 - 1.1
+      programVars.patternSpeed[first_led] = 0.9f + (((float) random(0, 20)) * 0.01);
+      programVars.patternOffset[first_led] = random(0, COOL_PERIOD_SECONDS);
+    }
+    if (second_led < NUM_LEDS) {
+      programVars.ledEnable[second_led] = true;
+      // These are based off of values taken for first_led.
+      // speed +/- 0.05, offset +/- 5 seconds
+      programVars.patternSpeed[second_led] = programVars.patternSpeed[first_led] - 0.05 + (((float) random(0, 10)) * 0.01);
+      programVars.patternOffset[second_led] = (programVars.patternOffset[first_led] - 5 + random(0, 10)) % COOL_PERIOD_SECONDS;
+      
+    }
+
+    timestamp_of_last_change = timestamp;
+  }
+}
+
+inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars, uint8_t led) {
+  if (programVars.ledEnable[led] == true) {
+    if (programVars.useSetFreq) {
+      programVars.pwmFreq[led] = programVars.setFreq;
+    } else {
+      if (programVars.runVariableDelta == true) {
+        // we need to base timestamp of off when the parameters were last set, otherwise leds with two different patternSpeed values
+        // will diverge further and further the longer the code runs, even if they specify a small offset.
+        uint32_t ts = timestamp - timestamp_of_last_change;
+        // modifies the delta/modifier based on the timestamp in seconds on a cycle (hence the modulo)
+        uint32_t relativeTime = ((uint32_t)(programVars.patternSpeed[led] * ts) + programVars.patternOffset[led]) % COOL_PERIOD_SECONDS;
+        //Serial.println("relativeTime " + String(relativeTime));
+        programVars.freqDelta[led] = freqDeltaLut[relativeTime];
+      }
+      programVars.pwmFreq[led] = final_freq * programVars.freqDelta[led];
+    }
+    
+    if ( programVars.pwmFreq[led] != prevFreqs[led]) {
+      ledcWriteTone(pwm_channel, programVars.pwmFreq[led]);
+      prevFreqs[led] = programVars.pwmFreq[led];  
+    }
+    // Not sure how ledcWriteTone and ledcWrite interact
+    // There is very little documentation. ledcWriteTone calls ledcWrite internally...
+    // so I'm not even sure if this call is required.
+    ledcWrite(pwm_channel, programVars.pwmDutyThou);
+  } else {
+    ledcWrite(pwm_channel, LED_OFF);
+  }
+  
 }
  
 void loop() {
- 
   // If Timer has fired do some non-realtime stuff
   if (xSemaphoreTake(timerSemaphore, 0) == pdTRUE){
     // If the buffers end in newline, try to parse the command an arguments
@@ -849,59 +712,69 @@ void loop() {
       serialBuffer = "";
     }
 
+    bool do_led_update = false;
+
     if (programVars.stateChange == true || fAdded == true) {
-      // reset c flhangeag
+      if (fAdded) {
+        // calculate the frequency from the average period
+        uint64_t sum_period = 0;
+        for (int i = 0; i < FREQ_MEASURE_SAMPLE_NUM; ++i)
+        {
+          sum_period += freq_ring_buffer[i];
+        }
+        // TODO: This is will calculate an incorrect sum until we have 128 samples
+        float avg_period = ((float)sum_period) / FREQ_MEASURE_SAMPLE_NUM;
+
+        double freq_at_motor = 1 / (avg_period * FREQ_MEASURE_TIMER_PERIOD);
+        final_freq = freq_at_motor * programVars.freqConversionFactor;
+      }
+      // make sure to update leds so that they reflect the new frequency measure
+      // actually delay this. updating frequency once a second should be enough unless the
+      // frequency is changing a lot.
+      //do_led_update = true;
+
+      // clear triggers
       fAdded = false;
       programVars.stateChange = false;
-
-
-      if (programVars.useSetFreq) {
-        programVars.pwmFreq = programVars.setFreq;
-      } else {
-        // calculate the frequency from the average period
-        sumPeriod = 0;
-        for (int i = 0; i < FREQ_MEASUER_SAMPLE_NUM; ++i)
-        {
-            sumPeriod += myRing[i];
-        }
-        avgPeriod = ((float)sumPeriod)/FREQ_MEASUER_SAMPLE_NUM; //or cast sum to double before division
-        programVars.pwmFreq = calculateFinalFrequency(avgPeriod, programVars.freqConversionFactor) * programVars.freqDelta;
-      }
-
-      messages = "Setting PWM duty to: " + String(programVars.pwmDutyThou) + \
-        " Frequency to: " + String(programVars.pwmFreq) + \
-        " User set freq to: " + String(programVars.setFreq);
-
-      Serial.println(messages);
-      SerialBT.println(messages);
-      // We need to change duty to 0 if LED is disabled
-      if (programVars.ledEnable == true) {
-        ledcWrite(LED_PWM_CHANNEL, programVars.pwmDutyThou);
-      } else {
-        messages = "Disabling LED";
-        ledcWrite(LED_PWM_CHANNEL, 0);
-      }
     }
 
-    // Timer fires every quarter second, so every four tickes
+    // Timer fires every quarter second, so every four ticks
     // we increment the timestamp and log
-    if (timestampQuarter%4 == 0) {
+    if (timestampQuarter % 4 == 0) {
       timestamp++;
       timestampQuarter = 0;
 
-      if (programVars.runVariableDelta == true) {
-        makeShitCoolAgain(timestamp, &programVars);
+      // STARTUP TEST - optionally run each led briefly at startup
+      uint32_t total_test_period = LED_TEST_PERIOD * NUM_LEDS;
+      if (do_test && test_progress < total_test_period) {
+        uint8_t current_led = test_progress / LED_TEST_PERIOD;
+        for (int i=0; i<NUM_LEDS; i++) {
+          programVars.ledEnable[i] = false;
+        }
+        programVars.ledEnable[current_led] = true;
+        programVars.patternSpeed[current_led] = 1.0f;
+        // start the current test led from the start of the pattern
+        programVars.patternOffset[current_led] = (2 * COOL_PERIOD_SECONDS - timestamp) % COOL_PERIOD_SECONDS;
+
+        test_progress++;
+        if (test_progress >= total_test_period) {
+          do_test = false;
+          test_progress = 0;
+          // 100% chance of new state
+          roll_the_dice(programVars, 100);
+        }
+      } else if (do_randomisation) {
+        // select some random LED parameters, including which LEDs are
+        // actually on
+        roll_the_dice(programVars, 10);
       }
 
-      // Change the PWM freq if it has changed
-      if ( programVars.pwmFreq != prevFreq) {
-        ledcWriteTone(LED_PWM_CHANNEL, programVars.pwmFreq);
-        prevFreq = programVars.pwmFreq;
-        if (programVars.ledEnable == true) {
-          ledcWrite(LED_PWM_CHANNEL, programVars.pwmDutyThou);
-        } else {
-          ledcWrite(LED_PWM_CHANNEL, 0);
-        }
+      do_led_update = true;
+    }
+
+    if (do_led_update) {
+      for (int i=0; i<NUM_LEDS; i++) {
+        updateLED(led_channels[i], programVars, i);
       }
 
       // print logging info if enabled
@@ -913,18 +786,8 @@ void loop() {
     }
   }
 
-  // Do realtime things
-  // Calculate the frequency
-  // programVars.pwmFreq = programVars.useSetFreq;
-  // if (programVars.useSetFreq) {
-  //   programVars.pwmFreq = programVars.useSetFreq;
-  // } else if (fAdded == true) {
-  //   programVars.pwmFreq = calculateFinalFrequency(frequencyRA, programVars.freqConversionFactor) + programVars.freqDelta;
-  // }
-
-
   // While there are characters in the Serial buffer
-  // read them in one at a time into sBuffer
+  // read them in one at a time into serialBuffer
   // We need to go via char probably due to implicit type conversions
   while(Serial.available() > 0){
     char inChar = Serial.read();
@@ -937,102 +800,4 @@ void loop() {
     serialBuffer += inChar;
   }
 
-
-  // Wait 50 ms
-  // ooooo, gross! Don't do that. naa fk ya
-  // delay(50);
 }
-
-// #include "TimerOne.h"
-
-// const int numreadings = 5;
-// volatile unsigned long readings[numreadings];
-// int index = 0;
-// unsigned long average = 0;
-// unsigned long period1 = 0;
-// unsigned long total=0;
-//
-// volatile unsigned block_timer = 0;
-// volatile bool block=false;
-//
-// volatile bool calcnow = false;
-//
-// //Strobe settings
-// const int strobePin = 9;
-// float dutyCycle = 5.0;  //percent
-// float dutyCycle_use = (dutyCycle / 100) * 1023;
-// float strobe_period_float = 0;
-// unsigned long period_microsec = 0;
-// const unsigned long non_strobe_period = 1000; //stobe period when not yet in strobe mode - just a light. 1000us == 1000hz
-//
-// float stobes_per_rot = 11.;
-//
-// void rps_counter(); // forward declare
-//
-//
-// void rps_counter(){ /* this code will be executed every time the interrupt 0 (pin2) gets low.*/
-//   //this is really a bit much code for an ISR, but we only have ~3 rps so it should be ok
-//
-//   if(block==false){
-//     readings[index] = micros();
-//     index++;
-//
-//     //Double triggering block
-//     block_timer = micros();
-//     block=true;
-//
-//     if(index >= numreadings){
-//      index=0;
-//      calcnow=true;
-//     }
-//   } //if "blocked", do nothing
-// }
-//
-// void setup() {
-//    Serial.begin(115200);
-//    //initial light mode
-//    Timer1.initialize(non_strobe_period);  // 10 000 000 us = 10 Hz
-//    Timer1.pwm(strobePin, dutyCycle_use);
-//
-//    attachInterrupt(0, rps_counter, FALLING); //interrupt 0 is pin 2
-// }
-//
-//
-// void loop(){
-//
-//   //Check hall effect block timer
-//   if(block){
-//     // detachInterrupt(0);    //Disable interrupt for ignoring multitriggers
-//     if(micros()-block_timer >= 100000){
-//       block=false;
-//       // attachInterrupt(0, rps_counter, FALLING); //enable interrupt
-//     }
-//   }
-//
-//   if(calcnow){
-//     // detachInterrupt(0);    //Disable interrupt when printing
-//     total = 0;
-//     for (int x=numreadings-1; x>=1; x--){ //count DOWN though the array, every 70 min this might make one glitch as the timer rolls over
-//       period1 = readings[x]-readings[x-1];
-//       total = total + period1;
-//     }
-//     average = total / (numreadings-1); //average period
-//
-//     Serial.println(average);
-//
-//     if(average<10000000){ //ie, more than 0.1hz of rotation.
-//       strobe_period_float = average / stobes_per_rot ;
-//       period_microsec = (unsigned int) strobe_period_float;
-//       Timer1.setPeriod(period_microsec);
-//       Timer1.pwm(strobePin, dutyCycle_use);
-//     }
-//     else{
-//       Serial.println("ack too slow, going to constant light");
-//       Timer1.setPeriod(non_strobe_period);
-//       Timer1.pwm(strobePin, dutyCycle_use);
-//     }
-//     calcnow = false;
-//     // attachInterrupt(0, rps_counter, FALLING); //enable interrupt
-//   }
-// }
-
