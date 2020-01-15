@@ -43,7 +43,12 @@
 // PWM resolution in bits
 #define LED_PWM_RESOLUTION            8
 // PWM inital duty
-#define LED_PWM_INITIAL_DUTY           5
+#define LED_PWM_INITIAL_DUTY          5
+// PWM LED off - you'd think 0 would be off, but depending on how it's wired
+// you may need to use 256, see discussion here:
+// https://github.com/espressif/arduino-esp32/issues/689
+#define LED_OFF                       256
+//#define LED_OFF                       0
 
 // We set up for three LEDs to be controlled...
 // DEVKIT V1 uses pin 23
@@ -671,7 +676,7 @@ inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars, uint8_t le
         uint32_t ts = timestamp - timestamp_of_last_change;
         // modifies the delta/modifier based on the timestamp in seconds on a cycle (hence the modulo)
         uint32_t relativeTime = ((uint32_t)(programVars.patternSpeed[led] * ts) + programVars.patternOffset[led]) % COOL_PERIOD_SECONDS;
-        Serial.println("relativeTime " + String(relativeTime));
+        //Serial.println("relativeTime " + String(relativeTime));
         programVars.freqDelta[led] = freqDeltaLut[relativeTime];
       }
       programVars.pwmFreq[led] = final_freq * programVars.freqDelta[led];
@@ -686,7 +691,7 @@ inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars, uint8_t le
     // so I'm not even sure if this call is required.
     ledcWrite(pwm_channel, programVars.pwmDutyThou);
   } else {
-    ledcWrite(pwm_channel, 0);
+    ledcWrite(pwm_channel, LED_OFF);
   }
   
 }
