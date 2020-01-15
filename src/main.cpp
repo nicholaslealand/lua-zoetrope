@@ -440,6 +440,11 @@ String formatProgVars(long time, ProgramVars &progVars) {
   } else {
     result += " useSetFreq=off ";
   }
+  if (progVars.runVariableDelta) {
+    result += " varDelta=on ";
+  } else {
+    result += " varDelta=off ";
+  }
   
   result += "pwmDuty: " + String(progVars.pwmDutyThou) + " ";
   for (int i = 0; i < NUM_LEDS; i++) {
@@ -577,6 +582,10 @@ void setup() {
     KeyPoint { 370, 1 },
   };
   buildLookupTable(keypoints, sizeof(keypoints)/sizeof(KeyPoint), freqDeltaLut, sizeof(freqDeltaLut)/sizeof(float));
+  // For debugging lut construction, might use it to check when trying spline interpolation...
+  //for (int i=0; i<100; i++) {
+  //  Serial.println(String(i) + " " + String(freqDeltaLut[i]));
+  //}
 
   // Setup frequency measure timer
   // Setup the timer
@@ -659,7 +668,7 @@ inline void updateLED(uint32_t pwm_channel, ProgramVars& programVars, uint8_t le
         uint32_t ts = timestamp - timestamp_of_last_change;
         // modifies the delta/modifier based on the timestamp in seconds on a cycle (hence the modulo)
         uint32_t relativeTime = ((uint32_t)(programVars.patternSpeed[led] * ts) + programVars.patternOffset[led]) % COOL_PERIOD_SECONDS;
-
+        Serial.println("relativeTime " + String(relativeTime));
         programVars.freqDelta[led] = freqDeltaLut[relativeTime];
       }
       programVars.pwmFreq[led] = final_freq * programVars.freqDelta[led];
@@ -709,7 +718,9 @@ void loop() {
         final_freq = freq_at_motor * programVars.freqConversionFactor;
       }
       // make sure to update leds so that they reflect the new frequency measure
-      do_led_update = true;
+      // actually delay this. updating frequency once a second should be enough unless the
+      // frequency is changing a lot.
+      //do_led_update = true;
 
       // clear triggers
       fAdded = false;
@@ -725,7 +736,7 @@ void loop() {
       // STARTUP TEST - optionally run each led briefly at startup
       uint32_t total_test_period = LED_TEST_PERIOD * NUM_LEDS;
       if (do_test && test_progress < total_test_period) {
-        uint8_t current_led = test_progress / NUM_LEDS;
+        uint8_t current_led = test_progress / LED_TEST_PERIOD;
         for (int i=0; i<NUM_LEDS; i++) {
           programVars.ledEnable[i] = false;
         }
